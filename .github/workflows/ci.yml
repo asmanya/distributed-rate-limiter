@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # buf breaking compares against the base branch, so it needs history.
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v9
+      # Installs buf, then lints the contract; breaking runs on PRs only.
+      - uses: bufbuild/buf-action@v1
+        with:
+          lint: true
+          format: false
+          push: false
+          pr_comment: false
+          breaking: ${{ github.event_name == 'pull_request' }}
+          breaking_against: ${{ format('{0}/{1}.git#branch={2}', github.server_url, github.repository, github.base_ref) }}
+      # gen/ is committed, so it must never drift from the proto files.
+      - name: Check gen/ is up to date
+        run: |
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          make tools
+          buf generate
+          test -z "$(git status --porcelain -- gen)" || { git status --porcelain -- gen; echo "gen/ is out of date: run 'make proto' and commit"; exit 1; }
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make test-integration
