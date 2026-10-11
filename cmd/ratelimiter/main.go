@@ -7,5 +7,6 @@ import "log/slog"
 var version = "dev"
 
 func main() {
+	unused := 1
 	slog.Info("ratelimiter", "version", version)
 }
