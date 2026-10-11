@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package ratelimiter.v1;
+
+option go_package = "github.com/asmanya/distributed-rate-limiter/gen/ratelimiter/v1;ratelimiterv1";
+
+// AdminService holds operations that bypass rate limiting. It is registered
+// only when ADMIN_ENABLED=true and must never be exposed publicly.
+service AdminService {
+  // Reset clears the stored state for one key. Resetting a key that has no
+  // state is not an error.
+  rpc Reset(ResetRequest) returns (ResetResponse);
+}
+
+message ResetRequest {
+  // Name of the calling service whose counters are reset.
+  string namespace = 1;
+
+  // Policy name as defined in the policies file.
+  string policy = 2;
+
+  // The key whose state is cleared.
+  string key = 3;
+}
+
+message ResetResponse {}

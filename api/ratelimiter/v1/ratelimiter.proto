@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package ratelimiter.v1;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/asmanya/distributed-rate-limiter/gen/ratelimiter/v1;ratelimiterv1";
+
+// RateLimitService answers one question: may this key consume `cost` units
+// right now? A denial is a normal OK response with allowed=false, not an error.
+service RateLimitService {
+  // Allow decides and, if allowed, consumes `cost` units from the key.
+  rpc Allow(AllowRequest) returns (AllowResponse);
+
+  // Peek returns the decision Allow would make right now, without consuming
+  // anything. It never changes state.
+  rpc Peek(PeekRequest) returns (PeekResponse);
+}
+
+message AllowRequest {
+  // Name of the calling service, e.g. "orders-api". Isolates counters between
+  // services that use the same policy name.
+  string namespace = 1;
+
+  // Policy name as defined in the policies file, e.g. "search".
+  string policy = 2;
+
+  // Who is being limited: a user id, API key or IP address.
+  string key = 3;
+
+  // Units to consume. 0 means 1.
+  int64 cost = 4;
+}
+
+message AllowResponse {
+  // Whether the request may proceed.
+  bool allowed = 1;
+
+  // The policy's limit (capacity).
+  int64 limit = 2;
+
+  // Units left after this decision.
+  int64 remaining = 3;
+
+  // How long to wait before retrying. Zero when allowed.
+  google.protobuf.Duration retry_after = 4;
+
+  // Time until the quota is fully replenished.
+  google.protobuf.Duration reset_after = 5;
+}
+
+message PeekRequest {
+  // Name of the calling service, e.g. "orders-api".
+  string namespace = 1;
+
+  // Policy name as defined in the policies file, e.g. "search".
+  string policy = 2;
+
+  // Who is being limited: a user id, API key or IP address.
+  string key = 3;
+
+  // Units the decision is evaluated for. 0 means 1.
+  int64 cost = 4;
+}
+
+message PeekResponse {
+  // Whether a request with this cost would be allowed right now.
+  bool allowed = 1;
+
+  // The policy's limit (capacity).
+  int64 limit = 2;
+
+  // Units that would be left after such a request.
+  int64 remaining = 3;
+
+  // How long to wait before such a request would be allowed. Zero if allowed.
+  google.protobuf.Duration retry_after = 4;
+
+  // Time until the quota is fully replenished.
+  google.protobuf.Duration reset_after = 5;
+}
