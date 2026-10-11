@@ -1,0 +1,12 @@
+services:
+  redis:
+    image: redis:8
+    ports:
+      - "6379:6379"
+    # Persistence is off on purpose: limiter state is temporary (every key has a TTL).
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
