@@ -53,7 +53,7 @@ func (r Request) Validate() error {
 	if r.Key == "" || len(r.Key) > maxKeyLen || strings.ContainsAny(r.Key, "{}") {
 		return ErrInvalidKey
 	}
-	if r.Limit <= 0 || r.Period <= 0 {
+	if r.Limit <= 0 || r.Period < time.Millisecond {
 		return ErrInvalidPolicy
 	}
 	if r.Cost <= 0 {

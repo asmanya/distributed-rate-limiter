@@ -30,6 +30,7 @@ func TestRequestValidate(t *testing.T) {
 		{"key at the 256 byte limit", func(r *Request) { r.Key = strings.Repeat("a", 256) }, nil},
 		{"key with braces", func(r *Request) { r.Key = "user{1}" }, ErrInvalidKey},
 		{"namespace with colon", func(r *Request) { r.Namespace = "orders:api" }, ErrInvalidName},
+		{"period below 1ms", func(r *Request) { r.Period = 500 * time.Microsecond }, ErrInvalidPolicy},
 		{"cost zero", func(r *Request) { r.Cost = 0 }, ErrInvalidCost},
 		{"cost above limit", func(r *Request) { r.Cost, r.Limit = 11, 10 }, ErrCostExceedsLimit},
 		{"limit zero", func(r *Request) { r.Limit = 0 }, ErrInvalidPolicy},
