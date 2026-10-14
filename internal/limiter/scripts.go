@@ -16,3 +16,9 @@ var tokenBucketSrc string
 // and falls back to EVAL on NOSCRIPT, so the source is sent only when Redis
 // does not know it yet.
 var tokenBucketScript = redis.NewScript(tokenBucketSrc)
+
+//go:embed scripts/sliding_window.lua
+var slidingWindowSrc string
+
+// slidingWindowScript is created once and never changes, like tokenBucketScript.
+var slidingWindowScript = redis.NewScript(slidingWindowSrc)
