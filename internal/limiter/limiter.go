@@ -47,11 +47,8 @@ type Limiter interface {
 // Validate checks the request in a fixed order: names, key, policy
 // parameters, cost.
 func (r Request) Validate() error {
-	if !validName(r.Namespace) || !validName(r.Policy) {
-		return ErrInvalidName
-	}
-	if r.Key == "" || len(r.Key) > maxKeyLen || strings.ContainsAny(r.Key, "{}") {
-		return ErrInvalidKey
+	if err := r.validateTarget(); err != nil {
+		return err
 	}
 	if r.Limit <= 0 || r.Period < time.Millisecond {
 		return ErrInvalidPolicy
@@ -61,6 +58,18 @@ func (r Request) Validate() error {
 	}
 	if r.Cost > r.Limit {
 		return ErrCostExceedsLimit
+	}
+	return nil
+}
+
+// validateTarget checks only what identifies the key. Reset needs no cost or
+// limit, so it validates just this.
+func (r Request) validateTarget() error {
+	if !validName(r.Namespace) || !validName(r.Policy) {
+		return ErrInvalidName
+	}
+	if r.Key == "" || len(r.Key) > maxKeyLen || strings.ContainsAny(r.Key, "{}") {
+		return ErrInvalidKey
 	}
 	return nil
 }

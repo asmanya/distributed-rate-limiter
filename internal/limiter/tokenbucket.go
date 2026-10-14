@@ -5,19 +5,17 @@ import (
 	"fmt"
 	"strconv"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
-// TokenBucket is the token bucket algorithm backed by one Lua script.
+// TokenBucket is the token bucket algorithm backed by Lua scripts.
 type TokenBucket struct {
-	rdb redis.Scripter
+	rdb Client
 }
 
-// NewTokenBucket returns a TokenBucket that runs its script on rdb. It takes
-// the Scripter interface, not a concrete client, so single-node and cluster
-// clients both work.
-func NewTokenBucket(rdb redis.Scripter) *TokenBucket {
+var _ Limiter = (*TokenBucket)(nil)
+
+// NewTokenBucket returns a TokenBucket that runs its scripts on rdb.
+func NewTokenBucket(rdb Client) *TokenBucket {
 	return &TokenBucket{rdb: rdb}
 }
 
@@ -26,23 +24,35 @@ func (t *TokenBucket) Allow(ctx context.Context, req Request) (Decision, error) 
 	if err := req.Validate(); err != nil {
 		return Decision{}, err
 	}
+	keys, args := tokenBucketCall(req)
+	return decide(tokenBucketScript.Run(ctx, t.rdb, keys, args...), req.Limit)
+}
 
-	cmd := tokenBucketScript.Run(ctx, t.rdb,
-		[]string{tokenBucketKey(req)},
-		req.Limit, formatRate(req), req.Cost, req.nowMillis(),
-	)
-	if err := cmd.Err(); err != nil {
-		// Both errors stay in the chain: callers match ErrStoreUnavailable, and
-		// can still tell a caller's expired deadline from a Redis failure.
-		return Decision{}, fmt.Errorf("%w: %w", ErrStoreUnavailable, err)
+// Peek returns the decision Allow would make right now, without changing
+// anything. It runs the read-only script with EVALSHA_RO.
+func (t *TokenBucket) Peek(ctx context.Context, req Request) (Decision, error) {
+	if err := req.Validate(); err != nil {
+		return Decision{}, err
 	}
+	keys, args := tokenBucketCall(req)
+	return decide(tokenBucketPeekScript.RunRO(ctx, t.rdb, keys, args...), req.Limit)
+}
 
-	reply, err := cmd.Int64Slice()
-	if err != nil {
-		// Redis answered, but not with integers: a script bug, not an outage.
-		return Decision{}, fmt.Errorf("limiter: unexpected script reply: %w", err)
+// Reset deletes the bucket. Deleting a missing key is not an error.
+func (t *TokenBucket) Reset(ctx context.Context, req Request) error {
+	if err := req.validateTarget(); err != nil {
+		return err
 	}
-	return decisionFromReply(req.Limit, reply)
+	if err := t.rdb.Del(ctx, tokenBucketKey(req)).Err(); err != nil {
+		return fmt.Errorf("%w: %w", ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+// tokenBucketCall builds the KEYS and ARGV shared by Allow and Peek.
+func tokenBucketCall(req Request) ([]string, []any) {
+	return []string{tokenBucketKey(req)},
+		[]any{req.Limit, formatRate(req), req.Cost, req.nowMillis()}
 }
 
 // formatRate returns tokens per millisecond as the shortest string that
