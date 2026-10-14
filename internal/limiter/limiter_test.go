@@ -1,6 +1,7 @@
 package limiter
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -44,6 +45,32 @@ func TestRequestValidate(t *testing.T) {
 				t.Fatalf("Validate() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResetValidation(t *testing.T) {
+	limiters := map[string]Limiter{
+		"token bucket":   NewTokenBucket(nil), // validation fails before Redis is touched
+		"sliding window": NewSlidingWindow(nil),
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Request)
+		want   error
+	}{
+		{"empty key", func(r *Request) { r.Key = "" }, ErrInvalidKey},
+		{"namespace with colon", func(r *Request) { r.Namespace = "orders:api" }, ErrInvalidName},
+	}
+	for lname, l := range limiters {
+		for _, tt := range tests {
+			t.Run(lname+"/"+tt.name, func(t *testing.T) {
+				req := validRequest()
+				tt.mutate(&req)
+				if got := l.Reset(context.Background(), req); !errors.Is(got, tt.want) {
+					t.Fatalf("Reset() = %v, want %v", got, tt.want)
+				}
+			})
+		}
 	}
 }
 
