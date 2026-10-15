@@ -114,7 +114,7 @@ func (s *RateLimit) decide(
 		Now:       s.now(),
 	})
 	if err != nil {
-		s.logFailure(ctx, err)
+		logFailure(ctx, s.log, err)
 		return limiter.Decision{}, statusFor(err)
 	}
 	return d, nil
@@ -122,16 +122,16 @@ func (s *RateLimit) decide(
 
 // logFailure records what the client is not told. Client mistakes are logged at
 // debug (they are not our problem); store failures and our own bugs at error.
-func (s *RateLimit) logFailure(ctx context.Context, err error) {
+func logFailure(ctx context.Context, log *slog.Logger, err error) {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-		s.log.DebugContext(ctx, "request ended by caller", "error", err)
+		log.DebugContext(ctx, "request ended by caller", "error", err)
 	case errors.Is(err, limiter.ErrStoreUnavailable):
-		s.log.ErrorContext(ctx, "rate limit store failed", "error", err)
+		log.ErrorContext(ctx, "rate limit store failed", "error", err)
 	case errors.Is(err, limiter.ErrInvalidKey), errors.Is(err, limiter.ErrInvalidName),
 		errors.Is(err, limiter.ErrInvalidCost), errors.Is(err, limiter.ErrCostExceedsLimit):
-		s.log.DebugContext(ctx, "invalid request", "error", err)
+		log.DebugContext(ctx, "invalid request", "error", err)
 	default:
-		s.log.ErrorContext(ctx, "unexpected limiter error", "error", err)
+		log.ErrorContext(ctx, "unexpected limiter error", "error", err)
 	}
 }
