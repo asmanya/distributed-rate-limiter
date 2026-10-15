@@ -6,6 +6,47 @@ Distributed rate limiting as a gRPC microservice — Go, Redis, Lua.
 
 > Work in progress.
 
+## Quickstart
+
+You need Go 1.27, Docker and [grpcurl](https://github.com/fullstorydev/grpcurl).
+
+```bash
+git clone https://github.com/asmanya/distributed-rate-limiter
+cd distributed-rate-limiter
+make up    # Redis 8 in Docker
+make run   # the service: gRPC on :8080, metrics on :9090
+```
+
+In another terminal, list what the server offers and call the `login` policy
+(5 requests per 10 seconds) six times:
+
+```bash
+grpcurl -plaintext localhost:8080 list
+
+for i in 1 2 3 4 5 6; do
+  grpcurl -plaintext \
+    -d '{"namespace":"demo","policy":"login","key":"user-1"}' \
+    localhost:8080 ratelimiter.v1.RateLimitService/Allow
+done
+```
+
+The first five answers have `"allowed": true` and a falling `remaining`. The
+sixth has no `allowed` field (grpcurl leaves out `false`) and a `retryAfter`:
+
+```json
+{
+  "limit": "5",
+  "retryAfter": "3.785s",
+  "resetAfter": "11.785s"
+}
+```
+
+A denial is a normal `OK` response, not an error. Policies live in
+[`deploy/policies.yaml`](deploy/policies.yaml); settings come from environment
+variables, see [`.env.example`](.env.example). The API is in
+[`api/ratelimiter/v1/`](api/ratelimiter/v1/) (`grpcurl describe` does not show
+the comments, read the `.proto` files).
+
 ## Algorithms
 
 Two algorithms are implemented in `internal/limiter`. Both keep O(1) memory per
