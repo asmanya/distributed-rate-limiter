@@ -15,7 +15,7 @@ import (
 
 // testClient connects to the Redis named by REDIS_URL. It skips, not fails,
 // when the variable is unset so a plain `go test` stays usable without Redis.
-func testClient(t *testing.T) *redis.Client {
+func testClient(t testing.TB) *redis.Client {
 	t.Helper()
 	url := os.Getenv("REDIS_URL")
 	if url == "" {
@@ -36,7 +36,7 @@ func testClient(t *testing.T) *redis.Client {
 // uniqueNamespace gives every test its own key space, so parallel tests (and
 // leftovers from earlier runs) never see each other's state. We never FLUSHALL:
 // the Redis may hold someone's other data.
-func uniqueNamespace(t *testing.T) string {
+func uniqueNamespace(t testing.TB) string {
 	t.Helper()
 	name := strings.Map(func(r rune) rune {
 		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
