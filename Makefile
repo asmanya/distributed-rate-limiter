@@ -1,4 +1,4 @@
-.PHONY: tools proto lint test test-integration up down
+.PHONY: tools proto lint test test-integration up down run
 
 # Install the proto plugins pinned in go.mod (tool directive).
 tools:
@@ -27,3 +27,9 @@ up:
 
 down:
 	docker compose down
+
+# Run the service, loading .env first if it exists. One line on purpose: every
+# recipe line is its own shell, so `set -a` (export everything sourced) and the
+# `go run` must share one.
+run:
+	@set -a; if [ -f .env ]; then . ./.env; fi; set +a; go run ./cmd/ratelimiter
