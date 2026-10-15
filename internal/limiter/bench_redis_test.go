@@ -29,8 +29,8 @@ func benchmarkAllow(b *testing.B, newLimiter func(Client) Limiter) {
 	b.Cleanup(func() { _ = l.Reset(ctx, req) })
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// b.Loop starts the timer at its first call, so setup above is not counted.
+	for b.Loop() {
 		if _, err := l.Allow(ctx, req); err != nil {
 			b.Fatal(err)
 		}
