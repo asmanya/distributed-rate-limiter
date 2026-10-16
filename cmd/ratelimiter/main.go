@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -97,6 +99,15 @@ func run() error {
 
 	srv := server.New(svc, m, log)
 
+	// SIGHUP reloads the policy file. The channel is buffered because Notify drops
+	// a signal it cannot deliver at once.
+	reloadCtx, stopReload := context.WithCancel(context.Background())
+	defer stopReload()
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP)
+	defer signal.Stop(sighup)
+	go watchReload(reloadCtx, sighup, func() error { return store.Reload(cfg.PolicyFile) }, log, m)
+
 	grpcLis, err := net.Listen("tcp", ":"+strconv.Itoa(cfg.Port))
 	if err != nil {
 		return fmt.Errorf("listen on PORT: %w", err)
@@ -116,6 +127,29 @@ func run() error {
 	err = <-errc
 	srv.Stop()
 	return err
+}
+
+// watchReload reloads the policies each time a signal arrives, until sigs is
+// closed or ctx ends. A failed reload is not fatal: Store.Reload swaps only a
+// valid file, so the old policies keep serving. It is logged and counted instead.
+func watchReload(ctx context.Context, sigs <-chan os.Signal, reload func() error, log *slog.Logger, m *metrics.Metrics) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-sigs:
+			if !ok {
+				return
+			}
+			if err := reload(); err != nil {
+				log.Error("policy reload failed, keeping old policies", "error", err)
+				m.PolicyReloads.WithLabelValues("failure").Inc()
+				continue
+			}
+			log.Info("policies reloaded")
+			m.PolicyReloads.WithLabelValues("success").Inc()
+		}
+	}
 }
 
 // stopped turns a server's return value into an error: a server that returns at
