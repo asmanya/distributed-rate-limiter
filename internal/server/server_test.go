@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -21,6 +23,7 @@ import (
 
 	ratelimiterv1 "github.com/asmanya/distributed-rate-limiter/gen/ratelimiter/v1"
 	"github.com/asmanya/distributed-rate-limiter/internal/limiter"
+	"github.com/asmanya/distributed-rate-limiter/internal/metrics"
 	"github.com/asmanya/distributed-rate-limiter/internal/policy"
 	"github.com/asmanya/distributed-rate-limiter/internal/service"
 )
@@ -54,25 +57,66 @@ func (onePolicy) Get(name string) (policy.Policy, bool) {
 	return policy.Policy{Name: "search", Algorithm: policy.TokenBucket, Limit: 10, Period: time.Minute}, true
 }
 
-func services(adminEnabled bool) Services {
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	limiters := map[policy.Algorithm]limiter.Limiter{policy.TokenBucket: allowAll{}}
-	svc := Services{RateLimit: service.NewRateLimit(onePolicy{}, limiters, time.Now, log)}
+// panicLimiter panics on Allow, to prove the interceptor chain turns it into
+// Internal and still records it.
+type panicLimiter struct{ allowAll }
+
+func (panicLimiter) Allow(context.Context, limiter.Request) (limiter.Decision, error) {
+	panic("boom")
+}
+
+// syncBuffer is a log sink the server goroutines write and the test reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func newMetrics(t *testing.T) *metrics.Metrics {
+	t.Helper()
+	m, err := metrics.New()
+	if err != nil {
+		t.Fatalf("metrics.New: %v", err)
+	}
+	return m
+}
+
+func services(adminEnabled bool, l limiter.Limiter, m *metrics.Metrics, log *slog.Logger) Services {
+	limiters := map[policy.Algorithm]limiter.Limiter{policy.TokenBucket: l}
+	svc := Services{RateLimit: service.NewRateLimit(onePolicy{}, limiters, time.Now, log, m)}
 	if adminEnabled {
 		svc.Admin = service.NewAdmin(onePolicy{}, limiters, time.Now, log)
 	}
 	return svc
 }
 
-// start runs a server on an in-memory listener and returns a client connected
+// env is a running server with the pieces a test wants to inspect.
+type env struct {
+	conn    *grpc.ClientConn
+	metrics *metrics.Metrics
+	logs    *syncBuffer
+}
+
+// startEnv runs a server on an in-memory listener and returns a client connected
 // to it. No port is opened.
-func start(t *testing.T, adminEnabled bool) *grpc.ClientConn {
+func startEnv(t *testing.T, adminEnabled bool, l limiter.Limiter) env {
 	t.Helper()
-	metrics, err := RuntimeMetrics()
-	if err != nil {
-		t.Fatalf("RuntimeMetrics: %v", err)
-	}
-	srv := New(services(adminEnabled), metrics)
+	m := newMetrics(t)
+	logs := &syncBuffer{}
+	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	srv := New(services(adminEnabled, l, m, log), m, log)
 	lis := bufconn.Listen(1 << 20)
 	go func() { _ = srv.ServeGRPC(lis) }()
 	t.Cleanup(srv.Stop)
@@ -87,7 +131,12 @@ func start(t *testing.T, adminEnabled bool) *grpc.ClientConn {
 		t.Fatalf("NewClient: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	return conn
+	return env{conn: conn, metrics: m, logs: logs}
+}
+
+func start(t *testing.T, adminEnabled bool) *grpc.ClientConn {
+	t.Helper()
+	return startEnv(t, adminEnabled, allowAll{}).conn
 }
 
 func ctx(t *testing.T) context.Context {
@@ -181,17 +230,18 @@ func listServices(t *testing.T, conn *grpc.ClientConn) []string {
 }
 
 func TestMetricsEndpoint(t *testing.T) {
-	metrics, err := RuntimeMetrics()
-	if err != nil {
-		t.Fatalf("RuntimeMetrics: %v", err)
-	}
-	srv := New(services(false), metrics)
+	m := newMetrics(t)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(services(false, allowAll{}, m, log), m, log)
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	go func() { _ = srv.ServeMetrics(lis) }()
 	t.Cleanup(srv.Stop)
+
+	// A Vec series only shows once it has been touched.
+	m.Decisions.WithLabelValues("search", "allowed").Inc()
 
 	req, err := http.NewRequestWithContext(ctx(t), http.MethodGet, "http://"+lis.Addr().String()+"/metrics", nil)
 	if err != nil {
@@ -207,7 +257,38 @@ func TestMetricsEndpoint(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if !strings.Contains(string(body), "go_goroutines") {
-		t.Fatalf("no Go runtime metrics in the response")
+	for _, want := range []string{"go_goroutines", "ratelimiter_decisions_total"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("/metrics missing %q", want)
+		}
+	}
+}
+
+// The plan's TRAP test: with recovery innermost, a panic still reaches the
+// logging and metrics interceptors as Internal.
+func TestPanicIsRecoveredLoggedAndCounted(t *testing.T) {
+	e := startEnv(t, false, panicLimiter{})
+	client := ratelimiterv1.NewRateLimitServiceClient(e.conn)
+
+	_, err := client.Allow(ctx(t), &ratelimiterv1.AllowRequest{Namespace: "orders-api", Policy: "search", Key: "user-1"})
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("code = %v (%v), want Internal", got, err)
+	}
+
+	method := "/ratelimiter.v1.RateLimitService/Allow"
+	if got := testutil.ToFloat64(e.metrics.RPCHandled.WithLabelValues(method, "Internal")); got != 1 {
+		t.Errorf("handled{Internal} = %v, want 1: a panic must be visible in metrics", got)
+	}
+	out := e.logs.String()
+	for _, want := range []string{"panic recovered", "code=Internal", "level=ERROR"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log missing %q: %s", want, out)
+		}
+	}
+
+	// The process is still serving.
+	if _, err := ratelimiterv1.NewRateLimitServiceClient(e.conn).Peek(ctx(t),
+		&ratelimiterv1.PeekRequest{Namespace: "orders-api", Policy: "search", Key: "user-1"}); err != nil {
+		t.Errorf("Peek after panic: %v", err)
 	}
 }
