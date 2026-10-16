@@ -70,3 +70,58 @@ The sliding window avoids the fixed-window double burst: ten requests just
 before a window boundary and ten just after are not both allowed
 ([test](internal/limiter/slidingwindow_test.go)). It is still an approximation,
 because the previous window is assumed to be evenly spread.
+
+## Failure modes
+
+What the service does when things go wrong. The commands and the raw output are
+in [docs/chaos.md](docs/chaos.md); you can repeat them with
+`bash scripts/chaos.sh`.
+
+| What happens | What the service does |
+| --- | --- |
+| Redis is slow, paused or stopped | `Allow` returns `Unavailable` after `REDIS_TIMEOUT` (50 ms by default); measured at about 51 ms. The process stays up and health stays `SERVING` |
+| Redis comes back | Requests succeed again without restarting the service |
+| The caller's own deadline expires or it cancels | `DeadlineExceeded` or `Canceled`, not `Unavailable`: that is not a store outage |
+| A handler panics | The caller gets `Internal`, the stack goes to the log, the process keeps serving |
+| `SIGTERM` | Health goes `NOT_SERVING`, requests in flight finish, then exit 0. After `SHUTDOWN_TIMEOUT` anything left is stopped by force |
+| `SIGHUP` with a broken policy file | The old policies keep serving; the failure is logged and counted |
+| Redis is down at startup | The service starts anyway and logs a warning |
+
+A denied request is not a failure: it is an `OK` response with `allowed=false`.
+
+Whether to let traffic through (fail open) or reject it (fail closed) when the
+limiter cannot answer is the caller's decision, not the service's
+([ADR 0003](docs/adr/0003-fail-mode-in-caller.md)). The client SDK that will
+carry that choice is not built yet.
+
+Two things to know when running it on a platform:
+
+- Policies reload on `SIGHUP`. A platform that cannot send your process a signal
+  (Cloud Run, for one) needs a new deploy to change a policy. Reload is meant
+  for a VM, or Kubernetes with a mounted ConfigMap.
+- Cloud Run allows 10 seconds between `SIGTERM` and `SIGKILL`, and
+  `SHUTDOWN_TIMEOUT` defaults to 10 seconds. Set it lower there.
+
+## Observability
+
+Metrics are served on `METRICS_PORT` (9090) at `/metrics`, together with the Go
+runtime and process metrics.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `grpc_server_handled_total` | counter | `method`, `code` | RPCs finished, by result |
+| `grpc_server_handling_seconds` | histogram | `method` | RPC latency |
+| `ratelimiter_decisions_total` | counter | `policy`, `result` | `Allow` decisions: `allowed` or `denied` |
+| `ratelimiter_redis_duration_seconds` | histogram | `script` | Redis round trip, buckets from 0.5 ms to 250 ms |
+| `ratelimiter_redis_errors_total` | counter | `script` | Redis failures |
+| `ratelimiter_policy_reloads_total` | counter | `result` | Reloads: `success` or `failure` |
+
+Labels only ever hold a small fixed set of values. The request key, a user id
+or an IP address is never a label, because every distinct value would become a
+new time series. Health checks are not counted.
+
+Logs are JSON on stderr, with `severity` and `message` fields so Cloud Logging
+reads them. There is one line per RPC with the method, code, duration and peer;
+successful calls log at debug, so with the default `LOG_LEVEL=info` you see
+only problems. The request key is never logged. Lines written by the Redis
+client go through the same logger.
