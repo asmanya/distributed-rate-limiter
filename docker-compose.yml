@@ -1,3 +1,9 @@
+# `make up` starts Redis only, for development.
+#
+# The demo stack, with two limiter replicas and a protected greeter service:
+#   docker compose --profile demo up -d --build --wait
+#   docker compose --profile demo down
+
 services:
   redis:
     image: redis:8
@@ -10,3 +16,51 @@ services:
       interval: 2s
       timeout: 2s
       retries: 10
+
+  ratelimiter:
+    profiles: ["demo"]
+    build:
+      context: .
+      args:
+        PKG: ./cmd/ratelimiter
+    # No published ports: with replicas, a fixed host port would clash. Only the
+    # greeter is reachable from outside; it finds the limiters by name.
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      # Local demo only, and safe here because no port is published.
+      ADMIN_ENABLED: "true"
+      # Successful RPCs log at debug, so without this the replica logs would stay
+      # empty and the demo could not show that both replicas serve traffic.
+      LOG_LEVEL: debug
+      POLICY_FILE: /policies.yaml
+    volumes:
+      # Mounted, not baked in: edit the file and `docker compose --profile demo
+      # kill -s HUP ratelimiter` reloads it.
+      - ./deploy/policies.yaml:/policies.yaml:ro
+    deploy:
+      replicas: 2
+    depends_on:
+      redis:
+        condition: service_healthy
+    # The greeter starts only when every replica listens, so its DNS lookup finds
+    # all of them and round robin spreads the calls over both.
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8080"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  greeter:
+    profiles: ["demo"]
+    build:
+      context: .
+      args:
+        PKG: ./examples/greeter
+    environment:
+      LIMITER_ADDR: dns:///ratelimiter:8080
+      GREETER_PORT: "50051"
+    ports:
+      - "50051:50051"
+    depends_on:
+      ratelimiter:
+        condition: service_healthy

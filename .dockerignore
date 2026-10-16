@@ -1,0 +1,14 @@
+# Private working files: they must never end up in an image.
+_workspace
+CLAUDE.md
+CLAUDE.local.md
+.claude
+.env
+
+# Not needed to build, and keeps the context small.
+.git
+.github
+.vscode
+bin
+docs
+*.md
