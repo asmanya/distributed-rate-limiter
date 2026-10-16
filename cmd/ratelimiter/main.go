@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -39,7 +40,7 @@ func run() error {
 		return err
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	log := newLogger(os.Stderr, cfg.LogLevel)
 	log.Info("starting", "version", version, "config", cfg) // Config redacts the Redis password
 
 	opts, err := redis.ParseURL(cfg.RedisURL)
@@ -113,4 +114,24 @@ func stopped(what string, err error) error {
 		return fmt.Errorf("%s stopped", what)
 	}
 	return fmt.Errorf("%s: %w", what, err)
+}
+
+// newLogger builds the JSON logger. Cloud Logging reads "severity" and "message",
+// not slog's "level" and "msg", so a severity filter works on Cloud Run.
+func newLogger(w io.Writer, level slog.Level) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{
+		Level: level,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if len(groups) > 0 {
+				return a
+			}
+			switch a.Key {
+			case slog.LevelKey:
+				a.Key = "severity"
+			case slog.MessageKey:
+				a.Key = "message"
+			}
+			return a
+		},
+	}))
 }
