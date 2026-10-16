@@ -99,6 +99,9 @@ func run() error {
 
 	srv := server.New(svc, m, log)
 
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
 	// SIGHUP reloads the policy file. The channel is buffered because Notify drops
 	// a signal it cannot deliver at once.
 	reloadCtx, stopReload := context.WithCancel(context.Background())
@@ -122,11 +125,27 @@ func run() error {
 	go func() { errc <- stopped("metrics server", srv.ServeMetrics(metricsLis)) }()
 	log.Info("listening", "grpc", grpcLis.Addr().String(), "metrics", metricsLis.Addr().String())
 
-	// Whichever server stops first takes the process down with it. Signals and
-	// graceful shutdown come in Phase 3.
-	err = <-errc
-	srv.Stop()
-	return err
+	// A server that stops on its own is a failure and takes the process down.
+	// SIGTERM or SIGINT is a normal exit: drain, then return nil (exit 0).
+	select {
+	case err = <-errc:
+		srv.Stop()
+		return err
+	case <-sigCtx.Done():
+	}
+	stop() // a second signal now kills the process at once instead of waiting
+
+	log.Info("shutting down", "timeout", cfg.ShutdownTimeout)
+	start := time.Now()
+	// A fresh context: sigCtx is already done.
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancelShutdown()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Warn("shutdown forced", "error", err)
+	}
+	// The deferred Redis Close runs after this, once nothing can use it.
+	log.Info("shutdown complete", "duration_ms", float64(time.Since(start).Microseconds())/1000)
+	return nil
 }
 
 // watchReload reloads the policies each time a signal arrives, until sigs is

@@ -4,7 +4,9 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -32,6 +34,7 @@ type Services struct {
 // listeners from outside, so tests can use bufconn or a random port.
 type Server struct {
 	grpc    *grpc.Server
+	health  *health.Server
 	metrics *http.Server
 }
 
@@ -69,6 +72,7 @@ func New(svc Services, m *metrics.Metrics, log *slog.Logger) *Server {
 	mux.Handle("/metrics", m.Handler())
 	return &Server{
 		grpc:    g,
+		health:  h,
 		metrics: &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second},
 	}
 }
@@ -86,7 +90,41 @@ func (s *Server) ServeMetrics(l net.Listener) error {
 	return nil
 }
 
-// Stop stops both servers immediately. Graceful shutdown comes in Phase 3.
+// Shutdown drains the server: health goes NOT_SERVING so load balancers stop
+// sending traffic, in-flight RPCs finish, then the metrics server stops. If ctx
+// ends first, whatever is still running is stopped by force and the error says so.
+//
+// gRPC drains before the metrics server so metrics can still be scraped while
+// the last requests finish.
+func (s *Server) Shutdown(ctx context.Context) error {
+	// Only for shutdown: a Redis outage never flips health (locked rule 7).
+	s.health.Shutdown()
+
+	done := make(chan struct{})
+	go func() {
+		s.grpc.GracefulStop()
+		close(done)
+	}()
+
+	var forced error
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// GracefulStop waits for every RPC, and a stream (even a health Watch)
+		// may never end. Stop makes it return.
+		s.grpc.Stop()
+		<-done
+		forced = fmt.Errorf("graceful stop timed out: %w", ctx.Err())
+	}
+
+	if err := s.metrics.Shutdown(ctx); err != nil {
+		_ = s.metrics.Close()
+	}
+	return forced
+}
+
+// Stop stops both servers immediately. It is for tests and for a server that
+// failed on its own; a normal exit goes through Shutdown.
 func (s *Server) Stop() {
 	s.grpc.Stop()
 	_ = s.metrics.Close()
