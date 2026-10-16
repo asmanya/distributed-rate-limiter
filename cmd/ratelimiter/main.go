@@ -50,6 +50,16 @@ func run() error {
 		// error quotes the URL, and the URL holds the password.
 		return errors.New("REDIS_URL is not a valid redis URL")
 	}
+	// Without these the REDIS_TIMEOUT budget exists only on paper:
+	//  - ContextTimeoutEnabled: otherwise a context deadline never reaches the socket.
+	//  - MaxRetries -1: 0 means "use the default of 3", -1 turns retries off. Four
+	//    attempts would blow a 50ms budget.
+	//  - DialTimeout and PoolTimeout bound a new connection and waiting for a free one.
+	// PoolSize stays at the default until Phase 5 gives us data.
+	opts.ContextTimeoutEnabled = true
+	opts.MaxRetries = -1
+	opts.DialTimeout = 2 * cfg.RedisTimeout
+	opts.PoolTimeout = cfg.RedisTimeout
 	rdb := redis.NewClient(opts)
 	defer func() { _ = rdb.Close() }()
 
@@ -69,13 +79,13 @@ func run() error {
 		return fmt.Errorf("load policies: %w", err)
 	}
 
-	limiters := map[policy.Algorithm]limiter.Limiter{
-		policy.TokenBucket:   limiter.NewTokenBucket(rdb),
-		policy.SlidingWindow: limiter.NewSlidingWindow(rdb),
-	}
 	m, err := metrics.New()
 	if err != nil {
 		return fmt.Errorf("metrics: %w", err)
+	}
+	limiters := map[policy.Algorithm]limiter.Limiter{
+		policy.TokenBucket:   limiter.NewInstrumented(limiter.NewTokenBucket(rdb), "tb", cfg.RedisTimeout, time.Now, m),
+		policy.SlidingWindow: limiter.NewInstrumented(limiter.NewSlidingWindow(rdb), "sw", cfg.RedisTimeout, time.Now, m),
 	}
 	svc := server.Services{
 		RateLimit: service.NewRateLimit(store, limiters, time.Now, log, m),
