@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package examples.greeter.v1;
+
+option go_package = "github.com/asmanya/distributed-rate-limiter/gen/examples/greeter/v1;greeterv1";
+
+// GreeterService is the demo service. It exists only to be protected by the rate
+// limiter SDK.
+service GreeterService {
+  // SayHello greets by name.
+  rpc SayHello(SayHelloRequest) returns (SayHelloResponse);
+}
+
+message SayHelloRequest {
+  // Who to greet.
+  string name = 1;
+}
+
+message SayHelloResponse {
+  // The greeting.
+  string message = 1;
+}
