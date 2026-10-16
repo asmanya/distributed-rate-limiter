@@ -17,6 +17,7 @@ import (
 
 	"github.com/asmanya/distributed-rate-limiter/internal/config"
 	"github.com/asmanya/distributed-rate-limiter/internal/limiter"
+	"github.com/asmanya/distributed-rate-limiter/internal/metrics"
 	"github.com/asmanya/distributed-rate-limiter/internal/policy"
 	"github.com/asmanya/distributed-rate-limiter/internal/server"
 	"github.com/asmanya/distributed-rate-limiter/internal/service"
@@ -72,19 +73,19 @@ func run() error {
 		policy.TokenBucket:   limiter.NewTokenBucket(rdb),
 		policy.SlidingWindow: limiter.NewSlidingWindow(rdb),
 	}
+	m, err := metrics.New()
+	if err != nil {
+		return fmt.Errorf("metrics: %w", err)
+	}
 	svc := server.Services{
-		RateLimit: service.NewRateLimit(store, limiters, time.Now, log),
+		RateLimit: service.NewRateLimit(store, limiters, time.Now, log, m),
 	}
 	if cfg.AdminEnabled {
 		svc.Admin = service.NewAdmin(store, limiters, time.Now, log)
 		log.Warn("admin service is enabled; never do this on a public endpoint")
 	}
 
-	metrics, err := server.RuntimeMetrics()
-	if err != nil {
-		return fmt.Errorf("metrics: %w", err)
-	}
-	srv := server.New(svc, metrics)
+	srv := server.New(svc, m, log)
 
 	grpcLis, err := net.Listen("tcp", ":"+strconv.Itoa(cfg.Port))
 	if err != nil {

@@ -15,6 +15,7 @@ import (
 
 	ratelimiterv1 "github.com/asmanya/distributed-rate-limiter/gen/ratelimiter/v1"
 	"github.com/asmanya/distributed-rate-limiter/internal/limiter"
+	"github.com/asmanya/distributed-rate-limiter/internal/metrics"
 	"github.com/asmanya/distributed-rate-limiter/internal/policy"
 )
 
@@ -32,12 +33,13 @@ type RateLimit struct {
 	limiters map[policy.Algorithm]limiter.Limiter
 	now      func() time.Time
 	log      *slog.Logger
+	metrics  *metrics.Metrics
 }
 
 // NewRateLimit builds the service. now is the only clock: the limiter never
-// reads one, so tests pass a fixed function here.
-func NewRateLimit(policies PolicySource, limiters map[policy.Algorithm]limiter.Limiter, now func() time.Time, log *slog.Logger) *RateLimit {
-	return &RateLimit{policies: policies, limiters: limiters, now: now, log: log}
+// reads one, so tests pass a fixed function here. m receives the decision counts.
+func NewRateLimit(policies PolicySource, limiters map[policy.Algorithm]limiter.Limiter, now func() time.Time, log *slog.Logger, m *metrics.Metrics) *RateLimit {
+	return &RateLimit{policies: policies, limiters: limiters, now: now, log: log, metrics: m}
 }
 
 // Allow decides and, if allowed, consumes the request's cost.
@@ -49,6 +51,10 @@ func (s *RateLimit) Allow(ctx context.Context, req *ratelimiterv1.AllowRequest) 
 	if err != nil {
 		return nil, err
 	}
+	// Only a real decision is counted: errors and unknown policies returned
+	// above, so the policy label is always a configured name, never user input.
+	// Peek does not count, it consumes nothing.
+	s.metrics.Decisions.WithLabelValues(req.GetPolicy(), resultLabel(d.Allowed)).Inc()
 	return &ratelimiterv1.AllowResponse{
 		Allowed:    d.Allowed,
 		Limit:      d.Limit,
@@ -74,6 +80,13 @@ func (s *RateLimit) Peek(ctx context.Context, req *ratelimiterv1.PeekRequest) (*
 		RetryAfter: durationpb.New(d.RetryAfter),
 		ResetAfter: durationpb.New(d.ResetAfter),
 	}, nil
+}
+
+func resultLabel(allowed bool) string {
+	if allowed {
+		return "allowed"
+	}
+	return "denied"
 }
 
 // decide is the flow shared by Allow and Peek; pick chooses which limiter method

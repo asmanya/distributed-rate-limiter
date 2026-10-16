@@ -5,19 +5,19 @@ package server
 
 import (
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
 	ratelimiterv1 "github.com/asmanya/distributed-rate-limiter/gen/ratelimiter/v1"
+	"github.com/asmanya/distributed-rate-limiter/internal/metrics"
+	"github.com/asmanya/distributed-rate-limiter/internal/server/interceptors"
 )
 
 // Services are the gRPC services to host.
@@ -35,10 +35,18 @@ type Server struct {
 	metrics *http.Server
 }
 
-// New registers the services, health and reflection, and routes /metrics to the
-// given handler.
-func New(svc Services, metrics http.Handler) *Server {
-	g := grpc.NewServer()
+// New registers the services, health and reflection, and serves /metrics from m.
+func New(svc Services, m *metrics.Metrics, log *slog.Logger) *Server {
+	// The first interceptor is the outermost. Logging and metrics sit outside
+	// recovery on purpose: recovery turns a panic into an Internal status, so they
+	// see the final code and the full duration, and a panic is logged and counted
+	// as Internal. With recovery outermost they would be skipped by the panic and
+	// panics would be invisible in the metrics.
+	g := grpc.NewServer(grpc.ChainUnaryInterceptor(
+		interceptors.Logging(log),
+		interceptors.Metrics(m),
+		interceptors.Recovery(log),
+	))
 	h := health.NewServer()
 
 	ratelimiterv1.RegisterRateLimitServiceServer(g, svc.RateLimit)
@@ -58,7 +66,7 @@ func New(svc Services, metrics http.Handler) *Server {
 	reflection.Register(g)
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", metrics)
+	mux.Handle("/metrics", m.Handler())
 	return &Server{
 		grpc:    g,
 		metrics: &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second},
@@ -82,19 +90,4 @@ func (s *Server) ServeMetrics(l net.Listener) error {
 func (s *Server) Stop() {
 	s.grpc.Stop()
 	_ = s.metrics.Close()
-}
-
-// RuntimeMetrics returns a handler for Go runtime and process metrics, on its
-// own registry (not the global default). Domain metrics replace it in Phase 3.
-func RuntimeMetrics() (http.Handler, error) {
-	reg := prometheus.NewRegistry()
-	for _, c := range []prometheus.Collector{
-		collectors.NewGoCollector(),
-		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-	} {
-		if err := reg.Register(c); err != nil {
-			return nil, err
-		}
-	}
-	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{}), nil
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -17,6 +18,7 @@ import (
 
 	ratelimiterv1 "github.com/asmanya/distributed-rate-limiter/gen/ratelimiter/v1"
 	"github.com/asmanya/distributed-rate-limiter/internal/limiter"
+	"github.com/asmanya/distributed-rate-limiter/internal/metrics"
 	"github.com/asmanya/distributed-rate-limiter/internal/policy"
 )
 
@@ -71,8 +73,18 @@ func limitersWith(f limiter.Limiter) map[policy.Algorithm]limiter.Limiter {
 	return map[policy.Algorithm]limiter.Limiter{policy.TokenBucket: f}
 }
 
-func newRateLimit(f *fakeLimiter) *RateLimit {
-	return NewRateLimit(testPolicies(), limitersWith(f), testNow, discardLogger())
+func newMetrics(t *testing.T) *metrics.Metrics {
+	t.Helper()
+	m, err := metrics.New()
+	if err != nil {
+		t.Fatalf("metrics.New: %v", err)
+	}
+	return m
+}
+
+func newRateLimit(t *testing.T, f *fakeLimiter) *RateLimit {
+	t.Helper()
+	return NewRateLimit(testPolicies(), limitersWith(f), testNow, discardLogger(), newMetrics(t))
 }
 
 func baseAllow() *ratelimiterv1.AllowRequest {
@@ -106,7 +118,7 @@ func TestAllowResponses(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := &fakeLimiter{decision: tt.decision}
-			got, err := newRateLimit(f).Allow(context.Background(), baseAllow())
+			got, err := newRateLimit(t, f).Allow(context.Background(), baseAllow())
 			if err != nil {
 				t.Fatalf("Allow: %v", err)
 			}
@@ -147,7 +159,7 @@ func TestAllowErrorMapping(t *testing.T) {
 			req := baseAllow()
 			tt.mutate(req)
 
-			resp, err := newRateLimit(f).Allow(context.Background(), req)
+			resp, err := newRateLimit(t, f).Allow(context.Background(), req)
 
 			if resp != nil {
 				t.Errorf("got a response %v alongside an error", resp)
@@ -166,7 +178,7 @@ func TestStoreErrorIsNotLeaked(t *testing.T) {
 	f := &fakeLimiter{err: fmt.Errorf("%w: %w", limiter.ErrStoreUnavailable,
 		errors.New("dial tcp 10.0.0.5:6379: password=hunter2"))}
 
-	_, err := newRateLimit(f).Allow(context.Background(), baseAllow())
+	_, err := newRateLimit(t, f).Allow(context.Background(), baseAllow())
 
 	msg := status.Convert(err).Message()
 	if msg != "rate limit store unavailable" {
@@ -194,7 +206,7 @@ func TestAllowCost(t *testing.T) {
 			f := &fakeLimiter{decision: limiter.Decision{Allowed: true}}
 			req := baseAllow()
 			req.Cost = tt.cost
-			if _, err := newRateLimit(f).Allow(context.Background(), req); err != nil {
+			if _, err := newRateLimit(t, f).Allow(context.Background(), req); err != nil {
 				t.Fatalf("Allow: %v", err)
 			}
 			if len(f.allowed) != 1 || f.allowed[0].Cost != tt.wantCost {
@@ -206,7 +218,7 @@ func TestAllowCost(t *testing.T) {
 
 func TestAllowPassesPolicyAndClock(t *testing.T) {
 	f := &fakeLimiter{decision: limiter.Decision{Allowed: true}}
-	if _, err := newRateLimit(f).Allow(context.Background(), baseAllow()); err != nil {
+	if _, err := newRateLimit(t, f).Allow(context.Background(), baseAllow()); err != nil {
 		t.Fatalf("Allow: %v", err)
 	}
 	want := limiter.Request{
@@ -226,7 +238,7 @@ func TestAllowPassesPolicyAndClock(t *testing.T) {
 func TestNoLimiterForAlgorithm(t *testing.T) {
 	// The policy asks for an algorithm no limiter was wired for: a wiring bug,
 	// reported as Internal, never a panic.
-	s := NewRateLimit(testPolicies(), map[policy.Algorithm]limiter.Limiter{}, testNow, discardLogger())
+	s := NewRateLimit(testPolicies(), map[policy.Algorithm]limiter.Limiter{}, testNow, discardLogger(), newMetrics(t))
 	_, err := s.Allow(context.Background(), baseAllow())
 	if got := status.Code(err); got != codes.Internal {
 		t.Fatalf("code = %v, want Internal", got)
@@ -238,7 +250,7 @@ func TestPeek(t *testing.T) {
 		f := &fakeLimiter{decision: limiter.Decision{Allowed: true, Limit: 10, Remaining: 9}}
 		req := &ratelimiterv1.PeekRequest{Namespace: "orders-api", Policy: "search", Key: "user-1"}
 
-		got, err := newRateLimit(f).Peek(context.Background(), req)
+		got, err := newRateLimit(t, f).Peek(context.Background(), req)
 		if err != nil {
 			t.Fatalf("Peek: %v", err)
 		}
@@ -255,7 +267,7 @@ func TestPeek(t *testing.T) {
 
 	t.Run("unknown policy", func(t *testing.T) {
 		req := &ratelimiterv1.PeekRequest{Namespace: "orders-api", Policy: "nope", Key: "k"}
-		_, err := newRateLimit(&fakeLimiter{}).Peek(context.Background(), req)
+		_, err := newRateLimit(t, &fakeLimiter{}).Peek(context.Background(), req)
 		if got := status.Code(err); got != codes.NotFound {
 			t.Fatalf("code = %v, want NotFound", got)
 		}
@@ -264,9 +276,74 @@ func TestPeek(t *testing.T) {
 	t.Run("store unavailable", func(t *testing.T) {
 		f := &fakeLimiter{err: fmt.Errorf("%w: %w", limiter.ErrStoreUnavailable, errors.New("down"))}
 		req := &ratelimiterv1.PeekRequest{Namespace: "orders-api", Policy: "search", Key: "k"}
-		_, err := newRateLimit(f).Peek(context.Background(), req)
+		_, err := newRateLimit(t, f).Peek(context.Background(), req)
 		if got := status.Code(err); got != codes.Unavailable {
 			t.Fatalf("code = %v, want Unavailable", got)
 		}
 	})
+}
+
+func TestAllowRecordsDecision(t *testing.T) {
+	tests := []struct {
+		name    string
+		allowed bool
+		result  string
+	}{
+		{"allowed", true, "allowed"},
+		{"denied", false, "denied"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newMetrics(t)
+			f := &fakeLimiter{decision: limiter.Decision{Allowed: tt.allowed}}
+			s := NewRateLimit(testPolicies(), limitersWith(f), testNow, discardLogger(), m)
+
+			if _, err := s.Allow(context.Background(), baseAllow()); err != nil {
+				t.Fatalf("Allow: %v", err)
+			}
+
+			if got := testutil.ToFloat64(m.Decisions.WithLabelValues("search", tt.result)); got != 1 {
+				t.Errorf("decisions{search,%s} = %v, want 1", tt.result, got)
+			}
+			if got := testutil.CollectAndCount(m.Decisions); got != 1 {
+				t.Errorf("series = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestNoDecisionRecorded(t *testing.T) {
+	storeDown := fmt.Errorf("%w: %w", limiter.ErrStoreUnavailable, errors.New("down"))
+	tests := []struct {
+		name string
+		call func(*RateLimit) error
+	}{
+		{"limiter error", func(s *RateLimit) error { _, err := s.Allow(context.Background(), baseAllow()); return err }},
+		{"unknown policy", func(s *RateLimit) error {
+			req := baseAllow()
+			req.Policy = "nope"
+			_, err := s.Allow(context.Background(), req)
+			return err
+		}},
+		{"peek", func(s *RateLimit) error {
+			_, err := s.Peek(context.Background(), &ratelimiterv1.PeekRequest{Namespace: "orders-api", Policy: "search", Key: "k"})
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newMetrics(t)
+			f := &fakeLimiter{decision: limiter.Decision{Allowed: true}}
+			if tt.name == "limiter error" {
+				f.err = storeDown
+			}
+			s := NewRateLimit(testPolicies(), limitersWith(f), testNow, discardLogger(), m)
+
+			_ = tt.call(s)
+
+			if got := testutil.CollectAndCount(m.Decisions); got != 0 {
+				t.Errorf("series = %d, want 0", got)
+			}
+		})
+	}
 }
