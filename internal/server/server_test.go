@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -57,6 +58,20 @@ func (onePolicy) Get(name string) (policy.Policy, bool) {
 	return policy.Policy{Name: "search", Algorithm: policy.TokenBucket, Limit: 10, Period: time.Minute}, true
 }
 
+// blockLimiter holds every Allow until release is closed, so a test can keep a
+// request in flight.
+type blockLimiter struct {
+	allowAll
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b blockLimiter) Allow(ctx context.Context, r limiter.Request) (limiter.Decision, error) {
+	b.started <- struct{}{}
+	<-b.release
+	return b.allowAll.Allow(ctx, r)
+}
+
 // panicLimiter panics on Allow, to prove the interceptor chain turns it into
 // Internal and still records it.
 type panicLimiter struct{ allowAll }
@@ -103,6 +118,7 @@ func services(adminEnabled bool, l limiter.Limiter, m *metrics.Metrics, log *slo
 
 // env is a running server with the pieces a test wants to inspect.
 type env struct {
+	srv     *Server
 	conn    *grpc.ClientConn
 	metrics *metrics.Metrics
 	logs    *syncBuffer
@@ -131,7 +147,7 @@ func startEnv(t *testing.T, adminEnabled bool, l limiter.Limiter) env {
 		t.Fatalf("NewClient: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	return env{conn: conn, metrics: m, logs: logs}
+	return env{srv: srv, conn: conn, metrics: m, logs: logs}
 }
 
 func start(t *testing.T, adminEnabled bool) *grpc.ClientConn {
@@ -290,5 +306,135 @@ func TestPanicIsRecoveredLoggedAndCounted(t *testing.T) {
 	if _, err := ratelimiterv1.NewRateLimitServiceClient(e.conn).Peek(ctx(t),
 		&ratelimiterv1.PeekRequest{Namespace: "orders-api", Policy: "search", Key: "user-1"}); err != nil {
 		t.Errorf("Peek after panic: %v", err)
+	}
+}
+
+func shutdownAsync(srv *Server, timeout time.Duration) <-chan error {
+	out := make(chan error, 1)
+	go func() {
+		c, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		out <- srv.Shutdown(c)
+	}()
+	return out
+}
+
+func waitFor[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(5 * time.Second): // a failure guard, not a wait the test relies on
+		t.Fatalf("timed out waiting for %s", what)
+		panic("unreachable")
+	}
+}
+
+func TestShutdownIdle(t *testing.T) {
+	e := startEnv(t, false, allowAll{})
+	if err := waitFor(t, shutdownAsync(e.srv, 5*time.Second), "Shutdown"); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// Zero dropped in-flight requests: Shutdown waits for the running RPC and the
+// client gets its answer.
+func TestShutdownLetsInFlightFinish(t *testing.T) {
+	b := blockLimiter{allowAll: allowAll{}, started: make(chan struct{}), release: make(chan struct{})}
+	e := startEnv(t, false, b)
+	client := ratelimiterv1.NewRateLimitServiceClient(e.conn)
+
+	type result struct {
+		resp *ratelimiterv1.AllowResponse
+		err  error
+	}
+	got := make(chan result, 1)
+	go func() {
+		resp, err := client.Allow(ctx(t), &ratelimiterv1.AllowRequest{Namespace: "orders-api", Policy: "search", Key: "user-1"})
+		got <- result{resp, err}
+	}()
+	waitFor(t, b.started, "the request to start")
+
+	sd := shutdownAsync(e.srv, 5*time.Second)
+	// An absence check: Shutdown must not return while a request is in flight.
+	// It can only miss a bug (pass by luck), never fail a correct server.
+	select {
+	case err := <-sd:
+		t.Fatalf("Shutdown returned with a request in flight: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(b.release)
+
+	r := waitFor(t, got, "the in-flight response")
+	if r.err != nil || !r.resp.GetAllowed() {
+		t.Fatalf("in-flight request = %v, %v; want allowed, nil", r.resp, r.err)
+	}
+	if err := waitFor(t, sd, "Shutdown"); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// A Watch stream never ends by itself, so graceful stop cannot finish: the
+// timeout must force it. It also shows health flipping to NOT_SERVING.
+func TestShutdownFlipsHealthAndForcesOnTimeout(t *testing.T) {
+	e := startEnv(t, false, allowAll{})
+	wctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := healthpb.NewHealthClient(e.conn).Watch(wctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	first, err := stream.Recv()
+	if err != nil || first.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		t.Fatalf("first = %v, %v; want SERVING", first.GetStatus(), err)
+	}
+
+	sd := shutdownAsync(e.srv, 100*time.Millisecond)
+
+	next, err := stream.Recv()
+	if err != nil || next.GetStatus() != healthpb.HealthCheckResponse_NOT_SERVING {
+		t.Fatalf("after shutdown = %v, %v; want NOT_SERVING", next.GetStatus(), err)
+	}
+	if err := waitFor(t, sd, "Shutdown"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown = %v, want a forced stop wrapping DeadlineExceeded", err)
+	}
+}
+
+func TestShutdownStopsMetricsServer(t *testing.T) {
+	m := newMetrics(t)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(services(false, allowAll{}, m, log), m, log)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- srv.ServeMetrics(lis) }()
+	url := "http://" + lis.Addr().String() + "/metrics"
+
+	get := func() error {
+		req, err := http.NewRequestWithContext(ctx(t), http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		return resp.Body.Close()
+	}
+	if err := get(); err != nil {
+		t.Fatalf("before Shutdown: %v", err)
+	}
+
+	if err := waitFor(t, shutdownAsync(srv, 5*time.Second), "Shutdown"); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := waitFor(t, served, "ServeMetrics to return"); err != nil {
+		t.Errorf("ServeMetrics = %v, want nil after Shutdown", err)
+	}
+	if err := get(); err == nil {
+		t.Error("metrics server still answers after Shutdown")
 	}
 }
