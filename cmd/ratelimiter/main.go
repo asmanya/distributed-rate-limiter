@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -62,6 +63,10 @@ func run() error {
 	opts.MaxRetries = -1
 	opts.DialTimeout = 2 * cfg.RedisTimeout
 	opts.PoolTimeout = cfg.RedisTimeout
+	// go-redis writes its own log lines (pool and connection trouble) to a global
+	// logger. Point it at ours before the first client exists, so they come out as
+	// JSON like everything else.
+	redis.SetLogger(redisLogger{log: log})
 	rdb := redis.NewClient(opts)
 	defer func() { _ = rdb.Close() }()
 
@@ -178,6 +183,17 @@ func stopped(what string, err error) error {
 		return fmt.Errorf("%s stopped", what)
 	}
 	return fmt.Errorf("%s: %w", what, err)
+}
+
+// redisLogger sends go-redis's own log lines to slog. go-redis gives no level;
+// what it logs is pool and connection trouble, so every line is a warning.
+type redisLogger struct {
+	log *slog.Logger
+}
+
+func (l redisLogger) Printf(ctx context.Context, format string, v ...any) {
+	// Some go-redis lines end in a newline, which has no place in a JSON field.
+	l.log.WarnContext(ctx, strings.TrimRight(fmt.Sprintf(format, v...), "\n"), "source", "go-redis")
 }
 
 // newLogger builds the JSON logger. Cloud Logging reads "severity" and "message",
