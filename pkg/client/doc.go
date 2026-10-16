@@ -24,7 +24,8 @@
 // protected service with the interceptor or the middleware, giving it the policy
 // to apply and a KeyFunc that says what is being limited: KeyFromMetadata and
 // KeyFromHeader read a request value, KeyFromPeer uses the caller's address.
-// Close the Client when the service stops.
+// Close the Client when the service stops. If the limiter's address resolves to
+// several replicas, the Client spreads its calls over all of them.
 //
 // The module is at v0, so this API can change before v1.0.0.
 package client

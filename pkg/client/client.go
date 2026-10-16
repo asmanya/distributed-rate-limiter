@@ -16,6 +16,12 @@ import (
 // default) plus the network. It is meant to be tuned with measurements.
 const defaultTimeout = 100 * time.Millisecond
 
+// roundRobinConfig spreads calls over every address the target resolves to.
+// gRPC's own default, pick_first, uses one address and leaves the other limiter
+// replicas idle; for a DNS name with several addresses that is not what anyone
+// wants, and with a single address it makes no difference.
+const roundRobinConfig = `{"loadBalancingConfig":[{"round_robin":{}}]}`
+
 // FailMode says what the interceptor and the middleware do when the limiter
 // cannot answer. There is no default: the zero value means "not set", and New
 // rejects it.
@@ -108,12 +114,19 @@ type Client struct {
 // New does no network I/O: gRPC connects on the first call. A nil error therefore
 // does not mean the limiter is reachable, and the fail mode has to work from the
 // very first request.
+//
+// If target resolves to several addresses (for example "dns:///ratelimiter:8080"
+// with several limiter replicas behind the name), calls are spread over all of
+// them, round robin.
 func New(target string, opts ...Option) (*Client, error) {
 	cfg, err := newConfig(opts)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(cfg.creds))
+	conn, err := grpc.NewClient(target,
+		grpc.WithTransportCredentials(cfg.creds),
+		grpc.WithDefaultServiceConfig(roundRobinConfig),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("client: create connection to %q: %w", target, err)
 	}
