@@ -54,9 +54,22 @@ func (c *Client) UnaryServerInterceptor(policies map[string]string, key KeyFunc)
 	}
 }
 
-// failed applies the fail mode to a limiter error. The request key is never
-// logged: it can be a user id or an IP.
+// failed applies the fail mode to a limiter error.
 func (c *Client) failed(ctx context.Context, method, policy string, err error, req any, handler grpc.UnaryHandler) (any, error) {
+	c.logFailure(ctx, method, policy, err)
+
+	if c.cfg.failMode == FailOpen {
+		return handler(ctx, req)
+	}
+	// Generic on purpose: what the limiter said is not for the caller.
+	return nil, status.Error(codes.Unavailable, "rate limiter unavailable")
+}
+
+// logFailure records why the limiter gave no answer. It is shared by the
+// interceptor and the middleware, so both log the same way. where is the method
+// or the HTTP verb: never the URL path or the request key, which can be a user
+// id or an IP.
+func (c *Client) logFailure(ctx context.Context, where, policy string, err error) {
 	code := status.Code(err)
 	log := slog.Default()
 
@@ -66,7 +79,7 @@ func (c *Client) failed(ctx context.Context, method, policy string, err error, r
 		// rejection itself, so only FailOpen needs a line saying limits are off.
 		if c.cfg.failMode == FailOpen {
 			log.WarnContext(ctx, "rate limiter unavailable, failing open",
-				"method", method, "policy", policy, "code", code.String())
+				"method", where, "policy", policy, "code", code.String())
 		}
 	default:
 		// InvalidArgument and NotFound mean the SDK is set up wrongly (a policy
@@ -74,14 +87,8 @@ func (c *Client) failed(ctx context.Context, method, policy string, err error, r
 		// surprise. The fail mode still applies, but loudly: under FailClosed a
 		// typo would take the whole service down, and nobody should miss it.
 		log.ErrorContext(ctx, "rate limiter returned an error, applying the fail mode",
-			"method", method, "policy", policy, "code", code.String(), "error", err)
+			"method", where, "policy", policy, "code", code.String(), "error", err)
 	}
-
-	if c.cfg.failMode == FailOpen {
-		return handler(ctx, req)
-	}
-	// Generic on purpose: what the limiter said is not for the caller.
-	return nil, status.Error(codes.Unavailable, "rate limiter unavailable")
 }
 
 // denied is the error for a request over its limit.
