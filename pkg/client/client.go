@@ -12,8 +12,9 @@ import (
 	ratelimiterv1 "github.com/asmanya/distributed-rate-limiter/gen/ratelimiter/v1"
 )
 
-// defaultTimeout is a starting value: the limiter's own Redis timeout (50 ms by
-// default) plus the network. It is meant to be tuned with measurements.
+// defaultTimeout is the limiter's own Redis timeout (50 ms by default) plus the
+// network, with room to spare. It was checked against the load test in
+// docs/benchmarks.md and left as it was.
 const defaultTimeout = 100 * time.Millisecond
 
 // roundRobinConfig spreads calls over every address the target resolves to.
@@ -58,7 +59,9 @@ type config struct {
 	creds     credentials.TransportCredentials
 }
 
-// WithTimeout limits each call to the limiter. The default is 100 ms.
+// WithTimeout limits each call to the limiter. The default is 100 ms: it must stay
+// above the limiter's REDIS_TIMEOUT plus the network, or the SDK gives up before
+// the limiter answers.
 func WithTimeout(d time.Duration) Option { return func(c *config) { c.timeout = d } }
 
 // WithFailMode sets what happens when the limiter cannot answer. It is required.
