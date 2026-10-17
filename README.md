@@ -81,9 +81,10 @@ value, `KeyFromPeer` uses the caller's IP address. A denied request gets
 [`examples/greeter/main.go`](examples/greeter/main.go) is a complete small
 service that does all of this.
 
-The SDK is at v0: its API can change before v1.0.0. Behind a proxy or load
-balancer, `KeyFromPeer` sees the proxy's address and every user would share one
-key; use `KeyFromHeader` with a header your proxy sets and overwrites.
+Only unary gRPC calls are limited; streaming RPCs are not. The SDK is at v0: its
+API can change before v1.0.0. Behind a proxy or load balancer, `KeyFromPeer` sees
+the proxy's address and every user would share one key; use `KeyFromHeader` with
+a header your proxy sets and overwrites.
 
 ## Run the service on its own
 
