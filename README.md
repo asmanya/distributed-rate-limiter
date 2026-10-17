@@ -8,11 +8,89 @@ Distributed rate limiting as a gRPC microservice — Go, Redis, Lua.
 
 ## Quickstart
 
-You need Go 1.27, Docker and [grpcurl](https://github.com/fullstorydev/grpcurl).
+The demo stack runs two limiter replicas that share one Redis, and a small
+service, the greeter, protected by the Go SDK. You need Docker and
+[grpcurl](https://github.com/fullstorydev/grpcurl).
 
 ```bash
 git clone https://github.com/asmanya/distributed-rate-limiter
 cd distributed-rate-limiter
+docker compose --profile demo up -d --build --wait
+```
+
+The first run downloads the Go image and builds two images, which took about a
+minute here. Then call the greeter ten times with the same key. Its policy
+allows 5 requests per 10 seconds per key:
+
+```bash
+for i in $(seq 1 10); do
+  grpcurl -plaintext -H 'x-api-key: demo' -d '{"name":"world"}' \
+    localhost:50051 examples.greeter.v1.GreeterService/SayHello
+done
+```
+
+The first five answer `{"message": "Hello, world!"}`. The next five are refused:
+
+```text
+ERROR:
+  Code: ResourceExhausted
+  Message: rate limit exceeded
+  Details:
+  1)	{
+    	  "@type": "type.googleapis.com/google.rpc.RetryInfo",
+    	  "retryDelay": "1.899s"
+    	}
+```
+
+`retryDelay` is how long to wait before trying again; it falls with every call
+and the key is allowed again after a few seconds.
+
+Both replicas answer these calls. The demo runs them with debug logging, so each
+call shows up as a line, prefixed with the replica that handled it:
+
+```bash
+docker compose --profile demo logs ratelimiter | grep '"message":"rpc"'
+```
+
+How the calls split between the two replicas varies from run to run. The count
+of allowed calls does not, because both replicas keep their state in the same
+Redis: [`test/e2e`](test/e2e/e2e_test.go) checks that exactly the limit is
+allowed when 1000 calls go through two servers.
+
+Stop the demo with the command below. `make down` does not: it only stops the
+services that are not part of the `demo` profile (Redis).
+
+```bash
+docker compose --profile demo down
+```
+
+## Using the SDK
+
+A service that wants its callers limited uses the Go SDK,
+[`pkg/client`](pkg/client/), on its server side. Create a client with the
+limiter's address, a namespace that names your service, a fail mode and transport
+credentials; the last three are required, so a plaintext connection or a
+fail-open setup is always a choice made in your code. Install
+`Client.UnaryServerInterceptor` on your gRPC server, or wrap an HTTP handler with
+`Client.HTTPMiddleware`, and tell it which policy to apply and, with a `KeyFunc`,
+what is being limited: `KeyFromMetadata` and `KeyFromHeader` read a request
+value, `KeyFromPeer` uses the caller's IP address. A denied request gets
+`ResourceExhausted` with a `RetryInfo` detail over gRPC, or `429` with
+`Retry-After` over HTTP. When the limiter cannot answer, the fail mode decides
+([ADR 0003](docs/adr/0003-fail-mode-in-caller.md)).
+[`examples/greeter/main.go`](examples/greeter/main.go) is a complete small
+service that does all of this.
+
+The SDK is at v0: its API can change before v1.0.0. Behind a proxy or load
+balancer, `KeyFromPeer` sees the proxy's address and every user would share one
+key; use `KeyFromHeader` with a header your proxy sets and overwrites.
+
+## Run the service on its own
+
+To run only the limiter, with Redis in Docker and the service on the host. You
+need Go 1.27, Docker and grpcurl.
+
+```bash
 make up    # Redis 8 in Docker
 make run   # the service: gRPC on :8080, metrics on :9090
 ```
@@ -91,8 +169,9 @@ A denied request is not a failure: it is an `OK` response with `allowed=false`.
 
 Whether to let traffic through (fail open) or reject it (fail closed) when the
 limiter cannot answer is the caller's decision, not the service's
-([ADR 0003](docs/adr/0003-fail-mode-in-caller.md)). The client SDK that will
-carry that choice is not built yet.
+([ADR 0003](docs/adr/0003-fail-mode-in-caller.md)). The Go SDK carries that
+choice: it has no default fail mode, and a client cannot be created without one
+(see [Using the SDK](#using-the-sdk)).
 
 Two things to know when running it on a platform:
 

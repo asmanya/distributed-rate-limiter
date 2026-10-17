@@ -30,8 +30,8 @@ The service only says that it could not decide:
   service that is working and waiting for its store.
 
 Whether to fail open or closed is decided by the caller, per call site, through
-the configuration of the client SDK (`pkg/client`, not built yet). The service
-has no failure-mode setting.
+the configuration of the client SDK (`pkg/client`). The service has no
+failure-mode setting.
 
 ## Alternatives considered
 
@@ -55,9 +55,10 @@ and silently removes the limit exactly where it is needed most.
 - Every caller has to choose. A wrong choice has a cost either way: failing open
   during an outage lets traffic past the limit, failing closed turns a Redis
   outage into an outage of the caller.
-- The SDK is not built yet. Until it exists, a caller using gRPC directly must
-  handle `Unavailable` itself. The SDK should make the choice explicit rather
-  than hide it behind a default.
+- The SDK makes the choice explicit rather than hide it behind a default: its
+  fail mode is a required option, and creating a client without one is an error.
+  A caller that uses gRPC directly, without the SDK, must handle `Unavailable`
+  itself.
 
 ## References
 
