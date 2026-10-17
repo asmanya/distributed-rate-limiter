@@ -280,6 +280,45 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+func TestPprofOnlyWhenEnabled(t *testing.T) {
+	tests := []struct {
+		name   string
+		pprof  bool
+		status int
+	}{
+		{"off", false, http.StatusNotFound},
+		{"on", true, http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newMetrics(t)
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
+			svc := services(false, allowAll{}, m, log)
+			svc.Pprof = tt.pprof
+			srv := New(svc, m, log)
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			go func() { _ = srv.ServeMetrics(lis) }()
+			t.Cleanup(srv.Stop)
+
+			req, err := http.NewRequestWithContext(ctx(t), http.MethodGet, "http://"+lis.Addr().String()+"/debug/pprof/cmdline", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("GET /debug/pprof/cmdline: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tt.status {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.status)
+			}
+		})
+	}
+}
+
 // The plan's TRAP test: with recovery innermost, a panic still reaches the
 // logging and metrics interceptors as Internal.
 func TestPanicIsRecoveredLoggedAndCounted(t *testing.T) {

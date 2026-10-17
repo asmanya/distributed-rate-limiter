@@ -24,6 +24,7 @@ type Config struct {
 	RedisTimeout    time.Duration
 	PolicyFile      string
 	AdminEnabled    bool
+	PprofEnabled    bool
 	LogLevel        slog.Level
 	ShutdownTimeout time.Duration
 }
@@ -85,6 +86,10 @@ func Load(getenv func(string) string) (Config, error) {
 		fail("ADMIN_ENABLED", "must be true or false, got %q", get("ADMIN_ENABLED", "false"))
 	}
 
+	if cfg.PprofEnabled, err = strconv.ParseBool(get("PPROF_ENABLED", "false")); err != nil {
+		fail("PPROF_ENABLED", "must be true or false, got %q", get("PPROF_ENABLED", "false"))
+	}
+
 	level, ok := parseLevel(get("LOG_LEVEL", "info"))
 	if !ok {
 		fail("LOG_LEVEL", "must be debug, info, warn or error, got %q", get("LOG_LEVEL", "info"))
@@ -144,6 +149,7 @@ func (c Config) LogValue() slog.Value {
 		slog.Duration("redis_timeout", c.RedisTimeout),
 		slog.String("policy_file", c.PolicyFile),
 		slog.Bool("admin_enabled", c.AdminEnabled),
+		slog.Bool("pprof_enabled", c.PprofEnabled),
 		slog.String("log_level", c.LogLevel.String()),
 		slog.Duration("shutdown_timeout", c.ShutdownTimeout),
 	)
