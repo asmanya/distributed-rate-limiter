@@ -63,6 +63,21 @@ ghz_run() { # ghz_run <duration> <concurrency> <payload> [extra ghz args...]
     --connections "$CONNECTIONS" "$@" "$GRPC"
 }
 
+# strip_details drops ghz's per-request records ("details", about 50 MB per run).
+# The summary, the latency distribution and the histogram stay: they are what the
+# numbers in docs/benchmarks.md come from.
+strip_details() {
+  python3 -I - "$1" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    d = json.load(f)
+d.pop("details", None)
+with open(path, "w") as f:
+    json.dump(d, f, indent=1)
+PY
+}
+
 run_one() { # run_one <scenario> <concurrency> <repeat>
   local sc=$1 conc=$2 rep=$3
   local name="${sc}${conc}-r${rep}"
@@ -85,6 +100,7 @@ run_one() { # run_one <scenario> <concurrency> <repeat>
   ghz_run "$DURATION" "$conc" "$(payload "$sc" "$tag")" -O json -o "$json"
   wait "$sampler"
   t1=$(cpu_ticks)
+  strip_details "$json"
 
   # Service CPU as a percentage of one core, over the measured run.
   awk -v a="$t0" -v b="$t1" -v d="$(secs "$DURATION")" \
