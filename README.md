@@ -1,15 +1,35 @@
 # distributed-rate-limiter
 
-Distributed rate limiting as a gRPC microservice — Go, Redis, Lua.
-
 ![CI](https://github.com/asmanya/distributed-rate-limiter/actions/workflows/ci.yml/badge.svg)
 
-> Work in progress.
+A rate limiter that runs as its own gRPC service, with Redis as the shared
+store. It answers one question: may this key spend `cost` units right now?
+Replicas keep no counters of their own, so a limit holds across all of them. A Go
+SDK plugs it into a gRPC server or a `net/http` handler.
+
+Work in progress. The SDK is v0, and its API can change before v1.0.0.
+
+## How it works
+
+- Every decision is one Lua script in Redis. Read, decide and write happen in a
+  single step, so two replicas can never both hand out the last unit
+  ([ADR 0001](docs/adr/0001-lua-atomicity.md)).
+- The service passes the current time into the script. Redis `TIME` is not
+  used, which keeps scripts deterministic and lets tests control the clock
+  ([ADR 0002](docs/adr/0002-time-source.md)).
+- A denied request is a normal `OK` response with `allowed=false`, and it writes
+  nothing to Redis.
+- If Redis fails or takes longer than `REDIS_TIMEOUT`, the service returns
+  `Unavailable`. Whether to let the request through is the caller's decision,
+  not the service's ([ADR 0003](docs/adr/0003-fail-mode-in-caller.md)).
+- Keys are `rl:{namespace:policy:key}:tb` and `rl:{namespace:policy:key}:sw:<window>`.
+  The braces are a Redis Cluster hash tag: all keys of one limiter land in one
+  slot.
 
 ## Quickstart
 
-The demo stack runs two limiter replicas that share one Redis, and a small
-service, the greeter, protected by the Go SDK. You need Docker and
+Two limiter replicas sharing one Redis, and a demo service (`greeter`)
+protected by the SDK. Needs Docker and
 [grpcurl](https://github.com/fullstorydev/grpcurl).
 
 ```bash
@@ -18,9 +38,7 @@ cd distributed-rate-limiter
 docker compose --profile demo up -d --build --wait
 ```
 
-The first run downloads the Go image and builds two images, which took about a
-minute here. Then call the greeter ten times with the same key. Its policy
-allows 5 requests per 10 seconds per key:
+The greeter allows 5 calls per 10 seconds per API key. Call it ten times:
 
 ```bash
 for i in $(seq 1 10); do
@@ -29,7 +47,7 @@ for i in $(seq 1 10); do
 done
 ```
 
-The first five answer `{"message": "Hello, world!"}`. The next five are refused:
+The first five return `{"message": "Hello, world!"}`. The rest are refused:
 
 ```text
 ERROR:
@@ -42,166 +60,228 @@ ERROR:
     	}
 ```
 
-`retryDelay` is how long to wait before trying again; it falls with every call
-and the key is allowed again after a few seconds.
-
-Both replicas answer these calls. The demo runs them with debug logging, so each
-call shows up as a line, prefixed with the replica that handled it:
+Both replicas serve these calls. The demo runs them at debug level, so each
+logs one line per call:
 
 ```bash
 docker compose --profile demo logs ratelimiter | grep '"message":"rpc"'
 ```
 
-How the calls split between the two replicas varies from run to run. The count
-of allowed calls does not, because both replicas keep their state in the same
-Redis: [`test/e2e`](test/e2e/e2e_test.go) checks that exactly the limit is
-allowed when 1000 calls go through two servers.
+The split between replicas changes from run to run. The number of allowed calls
+does not: [`test/e2e`](test/e2e/e2e_test.go) sends 1000 calls through two
+servers and checks that exactly the limit is allowed.
 
-Stop the demo with the command below. `make down` does not: it only stops the
-services that are not part of the `demo` profile (Redis).
+Stop it with `docker compose --profile demo down`. `make down` stops only Redis.
 
-```bash
-docker compose --profile demo down
+## API
+
+Contracts are in [`api/ratelimiter/v1/`](api/ratelimiter/v1/). Server
+reflection is on, so grpcurl works without the `.proto` files.
+
+| RPC | What it does |
+| --- | --- |
+| `RateLimitService.Allow` | Decides, and if allowed, takes `cost` units from the key |
+| `RateLimitService.Peek` | Returns the decision `Allow` would make, without changing anything |
+| `AdminService.Reset` | Clears one key's state. Registered only with `ADMIN_ENABLED=true`. Never expose it |
+
+A request carries `namespace` (the calling service, e.g. `orders-api`),
+`policy` (a name from the policies file), `key` (a user id, API key or IP) and
+`cost` (0 means 1). The response has `allowed`, `limit`, `remaining`,
+`retry_after` and `reset_after`.
+
+| Situation | Code |
+| --- | --- |
+| A decision was made, allowed or not | `OK` |
+| Bad name or key, negative cost, cost above the limit | `InvalidArgument` |
+| Unknown policy | `NotFound` |
+| Redis error or timeout | `Unavailable` |
+| The caller's deadline passed, or it cancelled | `DeadlineExceeded`, `Canceled` |
+| A bug (panic) in the handler | `Internal` |
+
+Namespace and policy must be non-empty and contain no `:`, `{` or `}`. The key
+must be 1 to 256 bytes with no `{` or `}`.
+
+## Go SDK
+
+[`pkg/client`](pkg/client/) is used on the server side of the service being
+protected. From [`examples/greeter`](examples/greeter/main.go):
+
+```go
+limiter, err := client.New("dns:///localhost:8080",
+	client.WithNamespace("greeter"),
+	client.WithFailMode(client.FailOpen),
+	client.WithTransportCredentials(insecure.NewCredentials()), // TLS in production
+)
+if err != nil {
+	return err
+}
+defer limiter.Close()
+
+limits := map[string]string{greeterv1.GreeterService_SayHello_FullMethodName: "greeter"}
+srv := grpc.NewServer(grpc.UnaryInterceptor(
+	limiter.UnaryServerInterceptor(limits, client.KeyFromMetadata("x-api-key"))))
 ```
 
-## Using the SDK
+For HTTP: `limiter.HTTPMiddleware("search", client.KeyFromHeader("X-API-Key"))(handler)`.
 
-A service that wants its callers limited uses the Go SDK,
-[`pkg/client`](pkg/client/), on its server side. Create a client with the
-limiter's address, a namespace that names your service, a fail mode and transport
-credentials; the last three are required, so a plaintext connection or a
-fail-open setup is always a choice made in your code. Install
-`Client.UnaryServerInterceptor` on your gRPC server, or wrap an HTTP handler with
-`Client.HTTPMiddleware`, and tell it which policy to apply and, with a `KeyFunc`,
-what is being limited: `KeyFromMetadata` and `KeyFromHeader` read a request
-value, `KeyFromPeer` uses the caller's IP address. A denied request gets
-`ResourceExhausted` with a `RetryInfo` detail over gRPC, or `429` with
-`Retry-After` over HTTP. When the limiter cannot answer, the fail mode decides
-([ADR 0003](docs/adr/0003-fail-mode-in-caller.md)).
-[`examples/greeter/main.go`](examples/greeter/main.go) is a complete small
-service that does all of this.
+- Namespace, fail mode and credentials have no defaults. Failing open and
+  running without TLS are choices your code makes explicitly.
+- The key comes from `KeyFromMetadata`, `KeyFromHeader` or `KeyFromPeer` (the
+  caller's IP). If the value is missing, the SDK uses the caller's IP. A key the
+  service would reject is hashed, so a malformed key cannot bypass the limit.
+- Denied: `ResourceExhausted` with `RetryInfo`, or HTTP `429` with
+  `Retry-After` in whole seconds.
+- Limiter unreachable: `FailOpen` lets the request through. `FailClosed`
+  returns `Unavailable`, or HTTP `503`.
+- Each call has a 100 ms timeout by default (`WithTimeout`). Keep it above the
+  service's `REDIS_TIMEOUT` plus the network.
+- Only unary RPCs are limited. Streaming RPCs pass through.
+- Behind a proxy, `KeyFromPeer` sees the proxy, and every user shares one key.
+  Use `KeyFromHeader` with a header the proxy sets and overwrites.
 
-Only unary gRPC calls are limited; streaming RPCs are not. The SDK is at v0: its
-API can change before v1.0.0. Behind a proxy or load balancer, `KeyFromPeer` sees
-the proxy's address and every user would share one key; use `KeyFromHeader` with
-a header your proxy sets and overwrites.
+## Running the service
 
-## Run the service on its own
-
-To run only the limiter, with Redis in Docker and the service on the host. You
-need Go 1.27, Docker and grpcurl.
+Needs Go 1.27 and Docker.
 
 ```bash
 make up    # Redis 8 in Docker
-make run   # the service: gRPC on :8080, metrics on :9090
+make run   # gRPC on :8080, metrics on :9090; reads .env if present
 ```
-
-In another terminal, list what the server offers and call the `login` policy
-(5 requests per 10 seconds) six times:
 
 ```bash
-grpcurl -plaintext localhost:8080 list
-
-for i in 1 2 3 4 5 6; do
-  grpcurl -plaintext \
-    -d '{"namespace":"demo","policy":"login","key":"user-1"}' \
-    localhost:8080 ratelimiter.v1.RateLimitService/Allow
-done
+grpcurl -plaintext -d '{"namespace":"demo","policy":"login","key":"user-1"}' \
+  localhost:8080 ratelimiter.v1.RateLimitService/Allow
 ```
 
-The first five answers have `"allowed": true` and a falling `remaining`. The
-sixth has no `allowed` field (grpcurl leaves out `false`) and a `retryAfter`:
+The `login` policy allows 5 per 10 seconds. The sixth call within 10 seconds
+returns no `allowed` field (grpcurl omits `false`) and a `retryAfter`.
 
-```json
-{
-  "limit": "5",
-  "retryAfter": "3.785s",
-  "resetAfter": "11.785s"
-}
+### Configuration
+
+Environment variables only. Invalid values stop startup, with every problem
+listed at once. A template is in [`.env.example`](.env.example).
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `PORT` | `8080` | gRPC |
+| `METRICS_PORT` | `9090` | HTTP, `/metrics`. Must differ from `PORT` |
+| `REDIS_URL` | `redis://localhost:6379/0` | `rediss://` for TLS. Only the host is logged |
+| `REDIS_TIMEOUT` | `50ms` | Per Redis call, 1ms to 1s |
+| `POLICY_FILE` | `deploy/policies.yaml` | |
+| `ADMIN_ENABLED` | `false` | Registers `AdminService` |
+| `PPROF_ENABLED` | `false` | Serves `/debug/pprof/` on `METRICS_PORT`. Not for production |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+| `SHUTDOWN_TIMEOUT` | `10s` | How long in-flight requests get after `SIGTERM` |
+
+### Policies
+
+```yaml
+policies:
+  - name: search
+    algorithm: token_bucket    # or sliding_window
+    limit: 100
+    period: 1m
 ```
 
-A denial is a normal `OK` response, not an error. Policies live in
-[`deploy/policies.yaml`](deploy/policies.yaml); settings come from environment
-variables, see [`.env.example`](.env.example). The API is in
-[`api/ratelimiter/v1/`](api/ratelimiter/v1/) (`grpcurl describe` does not show
-the comments, read the `.proto` files).
+Unknown fields are rejected. `SIGHUP` reloads the file. If the new file is
+invalid, the old policies stay in effect and the failure is logged and counted.
 
 ## Algorithms
 
-Two algorithms are implemented in `internal/limiter`. Both keep O(1) memory per
-key.
+Both use O(1) memory per key.
 
 | | Token bucket | Sliding window counter |
 | --- | --- | --- |
-| State in Redis | One hash: tokens left, last update time | Two counters: current and previous window |
-| Behaviour | Allows a burst up to capacity, then refills at a steady rate | At most `limit` per window; the previous window still counts, in proportion |
-| Accuracy | Exact | An approximation (see below) |
-| Fits | General APIs, e.g. 100 requests per minute with bursts | Strict quotas, e.g. 5 logins per 10 seconds |
+| State | One hash: tokens left, last update | Two counters: this window and the previous one |
+| Behaviour | Bursts up to `limit`, then refills at `limit` per `period` | At most `limit` per window, with the previous window weighted in |
+| Accuracy | Exact | Approximate: assumes the previous window was evenly spread |
+| Use for | General APIs with bursts | Strict quotas, e.g. 5 logins per 10 seconds |
 
-Every decision is a single Lua script run inside Redis, so concurrent callers
-cannot interleave between the read and the write
-([ADR 0001](docs/adr/0001-lua-atomicity.md)). The proof is
-[`accuracy_test.go`](test/load/accuracy_test.go): 2000 attempts from 200
-goroutines, with one and with two Redis clients, against a limit of 500 allow
-exactly 500, for both algorithms.
-
-The sliding window avoids the fixed-window double burst: ten requests just
-before a window boundary and ten just after are not both allowed
-([test](internal/limiter/slidingwindow_test.go)). It is still an approximation,
-because the previous window is assumed to be evenly spread.
+The sliding window prevents the fixed-window double burst at a boundary
+([test](internal/limiter/slidingwindow_test.go)).
+[`test/load/accuracy_test.go`](test/load/accuracy_test.go) sends 2000 requests
+from 200 goroutines, over one and two Redis clients, against a limit of 500.
+Both algorithms allow exactly 500.
 
 ## Failure modes
 
-What the service does when things go wrong. The commands and the raw output are
-in [docs/chaos.md](docs/chaos.md); you can repeat them with
-`bash scripts/chaos.sh`.
+Reproduced by [`scripts/chaos.sh`](scripts/chaos.sh). Raw output is in
+[docs/chaos.md](docs/chaos.md).
 
-| What happens | What the service does |
+| Event | Behaviour |
 | --- | --- |
-| Redis is slow, paused or stopped | `Allow` returns `Unavailable` after `REDIS_TIMEOUT` (50 ms by default); measured at about 51 ms. The process stays up and health stays `SERVING` |
-| Redis comes back | Requests succeed again without restarting the service |
-| The caller's own deadline expires or it cancels | `DeadlineExceeded` or `Canceled`, not `Unavailable`: that is not a store outage |
-| A handler panics | The caller gets `Internal`, the stack goes to the log, the process keeps serving |
-| `SIGTERM` | Health goes `NOT_SERVING`, requests in flight finish, then exit 0. After `SHUTDOWN_TIMEOUT` anything left is stopped by force |
-| `SIGHUP` with a broken policy file | The old policies keep serving; the failure is logged and counted |
-| Redis is down at startup | The service starts anyway and logs a warning |
+| Redis slow, paused or stopped | `Unavailable` after `REDIS_TIMEOUT` (measured about 51 ms with 50 ms). The process stays up and health stays `SERVING` |
+| Redis comes back | Requests succeed again, no restart |
+| Redis down at startup | Starts anyway and logs a warning |
+| Caller's deadline expires or it cancels | `DeadlineExceeded` or `Canceled`, not `Unavailable` |
+| Handler panics | `Internal` to the caller, stack in the log, process keeps serving |
+| `SIGTERM` | Health goes `NOT_SERVING`, in-flight requests finish, exit 0. After `SHUTDOWN_TIMEOUT` the rest are stopped |
+| `SIGHUP` with a broken policy file | Old policies keep serving |
 
-A denied request is not a failure: it is an `OK` response with `allowed=false`.
+Health never depends on Redis. A Redis outage should not make the platform
+restart every replica.
 
-Whether to let traffic through (fail open) or reject it (fail closed) when the
-limiter cannot answer is the caller's decision, not the service's
-([ADR 0003](docs/adr/0003-fail-mode-in-caller.md)). The Go SDK carries that
-choice: it has no default fail mode, and a client cannot be created without one
-(see [Using the SDK](#using-the-sdk)).
-
-Two things to know when running it on a platform:
-
-- Policies reload on `SIGHUP`. A platform that cannot send your process a signal
-  (Cloud Run, for one) needs a new deploy to change a policy. Reload is meant
-  for a VM, or Kubernetes with a mounted ConfigMap.
-- Cloud Run allows 10 seconds between `SIGTERM` and `SIGKILL`, and
-  `SHUTDOWN_TIMEOUT` defaults to 10 seconds. Set it lower there.
+On platforms that cannot send `SIGHUP` (Cloud Run, for one), changing a policy
+needs a redeploy. Cloud Run gives 10 seconds between `SIGTERM` and `SIGKILL`,
+the same as the default `SHUTDOWN_TIMEOUT`, so set it lower there.
 
 ## Observability
 
-Metrics are served on `METRICS_PORT` (9090) at `/metrics`, together with the Go
-runtime and process metrics.
+Prometheus metrics on `METRICS_PORT` at `/metrics`, plus the Go runtime and
+process metrics.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `grpc_server_handled_total` | counter | `method`, `code` | RPCs finished, by result |
+| `grpc_server_handled_total` | counter | `method`, `code` | RPCs finished |
 | `grpc_server_handling_seconds` | histogram | `method` | RPC latency |
-| `ratelimiter_decisions_total` | counter | `policy`, `result` | `Allow` decisions: `allowed` or `denied` |
-| `ratelimiter_redis_duration_seconds` | histogram | `script` | Redis round trip, buckets from 0.5 ms to 250 ms |
+| `ratelimiter_decisions_total` | counter | `policy`, `result` | `allowed` or `denied` |
+| `ratelimiter_redis_duration_seconds` | histogram | `script` | Redis round trip, 0.5 ms to 250 ms buckets |
 | `ratelimiter_redis_errors_total` | counter | `script` | Redis failures |
-| `ratelimiter_policy_reloads_total` | counter | `result` | Reloads: `success` or `failure` |
+| `ratelimiter_policy_reloads_total` | counter | `result` | `success` or `failure` |
 
-Labels only ever hold a small fixed set of values. The request key, a user id
-or an IP address is never a label, because every distinct value would become a
-new time series. Health checks are not counted.
+No label ever holds a request key, user id or IP address. Health checks are not
+counted.
 
-Logs are JSON on stderr, with `severity` and `message` fields so Cloud Logging
-reads them. There is one line per RPC with the method, code, duration and peer;
-successful calls log at debug, so with the default `LOG_LEVEL=info` you see
-only problems. The request key is never logged. Lines written by the Redis
-client go through the same logger.
+Logs are JSON on stderr, with `severity` and `message` fields for Cloud
+Logging. One line per RPC with method, code, duration and peer. Successful
+calls log at debug, so at the default `info` you only see problems. Request
+keys are never logged.
+
+## Benchmarks
+
+Median of 3 runs, 30 s each, with `ghz` over one gRPC connection against a
+token bucket policy, Redis 8 in Docker. ghz, the service and Redis all ran on
+one AMD Ryzen 5 5600H laptop inside WSL2.
+
+| Scenario | RPS | p50 | p99 |
+| --- | --- | --- | --- |
+| 10,000 keys, 10 concurrent clients | 7,623 | 1.08 ms | 2.05 ms |
+| 10,000 keys, 50 concurrent clients | 15,868 | 2.58 ms | 5.95 ms |
+| 10,000 keys, 100 concurrent clients | 18,696 | 4.41 ms | 9.76 ms |
+| One hot key, 100 concurrent clients | 20,140 | 4.21 ms | 9.30 ms |
+
+With 10,000 keys, going from 50 to 100 clients raised RPS by 18 % and p50 by
+71 %. At 100 clients Redis was at 89 to 93 % of one core (one sample per run),
+and a CPU profile showed no hot spot in the service's own code. The ceiling is the Redis round trip. A hot key is no
+slower than 10,000 keys because Redis runs every script on one thread anyway.
+
+One machine, no network between the parts. Hosted Redis, Redis Cluster and the
+sliding window were not measured. Method, raw output and analysis:
+[docs/benchmarks.md](docs/benchmarks.md).
+
+## Development
+
+| Command | |
+| --- | --- |
+| `make tools` | Install the pinned tools (`go install tool`) |
+| `make proto` | Lint the `.proto` files and regenerate `gen/` |
+| `make lint` | `golangci-lint` and `buf lint` |
+| `make test` | Unit tests, with `-race` |
+| `make test-integration` | Integration tests against a real Redis. Run `make up` and export `REDIS_URL` first, or they skip |
+| `make load` | The benchmark matrix, about 15 minutes |
+
+Design decisions are recorded in [`docs/adr/`](docs/adr/).
+
+## License
+
+[MIT](LICENSE)
