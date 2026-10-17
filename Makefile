@@ -1,4 +1,4 @@
-.PHONY: tools proto lint test test-integration up down run
+.PHONY: tools proto lint test test-integration up down run load
 
 # Install the proto plugins pinned in go.mod (tool directive).
 tools:
@@ -33,3 +33,8 @@ down:
 # `go run` must share one.
 run:
 	@set -a; if [ -f .env ]; then . ./.env; fi; set +a; go run ./cmd/ratelimiter
+
+# The load test matrix (about 15 minutes). Needs Redis (make up) and ghz; results
+# go to docs/benchmarks/raw. Local only, never against a hosted Redis.
+load:
+	bash scripts/load.sh
