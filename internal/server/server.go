@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"time"
 
 	"google.golang.org/grpc"
@@ -28,6 +29,9 @@ type Services struct {
 	// Admin is nil unless ADMIN_ENABLED=true. A nil Admin means the service is
 	// not registered at all: it does not show up in reflection or health.
 	Admin ratelimiterv1.AdminServiceServer
+	// Pprof serves /debug/pprof/ on the metrics port. It exposes internals and
+	// a profile request costs CPU, so it is off unless PPROF_ENABLED=true.
+	Pprof bool
 }
 
 // Server is the gRPC server plus the metrics HTTP server. It takes the
@@ -70,6 +74,16 @@ func New(svc Services, m *metrics.Metrics, log *slog.Logger) *Server {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", m.Handler())
+	if svc.Pprof {
+		// Our own mux, so the net/http/pprof init() on DefaultServeMux does
+		// not apply: the handlers are registered by hand. No WriteTimeout on
+		// the server: a 30 s CPU profile would be cut off.
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
 	return &Server{
 		grpc:    g,
 		health:  h,

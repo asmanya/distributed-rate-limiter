@@ -102,6 +102,11 @@ func run() error {
 		log.Warn("admin service is enabled; never do this on a public endpoint")
 	}
 
+	svc.Pprof = cfg.PprofEnabled
+	if cfg.PprofEnabled {
+		log.Warn("pprof is enabled on the metrics port; never do this on a public endpoint")
+	}
+
 	srv := server.New(svc, m, log)
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)

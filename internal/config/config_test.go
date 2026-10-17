@@ -34,7 +34,7 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Port != 8080 || cfg.MetricsPort != 9090 ||
 		cfg.RedisURL != "redis://localhost:6379/0" ||
 		cfg.RedisTimeout != 50*time.Millisecond ||
-		cfg.AdminEnabled ||
+		cfg.AdminEnabled || cfg.PprofEnabled ||
 		cfg.LogLevel != slog.LevelInfo ||
 		cfg.ShutdownTimeout != 10*time.Second {
 		t.Fatalf("unexpected defaults: %v", cfg)
@@ -50,6 +50,7 @@ func TestLoadCustom(t *testing.T) {
 		"REDIS_TIMEOUT":    "200ms",
 		"POLICY_FILE":      file,
 		"ADMIN_ENABLED":    "true",
+		"PPROF_ENABLED":    "true",
 		"LOG_LEVEL":        "WARN",
 		"SHUTDOWN_TIMEOUT": "5s",
 	}))
@@ -57,7 +58,7 @@ func TestLoadCustom(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.Port != 9000 || cfg.MetricsPort != 9100 || cfg.RedisTimeout != 200*time.Millisecond ||
-		cfg.PolicyFile != file || !cfg.AdminEnabled || cfg.LogLevel != slog.LevelWarn ||
+		cfg.PolicyFile != file || !cfg.AdminEnabled || !cfg.PprofEnabled || cfg.LogLevel != slog.LevelWarn ||
 		cfg.ShutdownTimeout != 5*time.Second || cfg.RedisHost() != "redis.example.com:6380" {
 		t.Fatalf("unexpected config: %v", cfg)
 	}
@@ -80,6 +81,7 @@ func TestLoadInvalid(t *testing.T) {
 		{"timeout above 1s", map[string]string{"REDIS_TIMEOUT": "2s"}, "REDIS_TIMEOUT"},
 		{"policy file missing", map[string]string{"POLICY_FILE": "/no/such/file.yaml"}, "POLICY_FILE"},
 		{"admin not a bool", map[string]string{"ADMIN_ENABLED": "maybe"}, "ADMIN_ENABLED"},
+		{"pprof not a bool", map[string]string{"PPROF_ENABLED": "maybe"}, "PPROF_ENABLED"},
 		{"unknown log level", map[string]string{"LOG_LEVEL": "loud"}, "LOG_LEVEL"},
 		{"shutdown timeout zero", map[string]string{"SHUTDOWN_TIMEOUT": "0s"}, "SHUTDOWN_TIMEOUT"},
 	}
