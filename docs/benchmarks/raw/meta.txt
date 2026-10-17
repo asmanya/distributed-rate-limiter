@@ -1,0 +1,4 @@
+commit: 88472d6
+date: 2026-10-17T13:31:32Z
+duration: 30s  warmup: 10s  repeats: 3  connections: 1
+service: POLICY_FILE=deploy/policies.load.yaml LOG_LEVEL=warn, other settings default

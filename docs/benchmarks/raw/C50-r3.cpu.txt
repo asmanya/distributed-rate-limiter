@@ -1,0 +1,2 @@
+service_cpu_percent_of_one_core 297.9
+redis_cpu_percent_docker_stats 75.01%
