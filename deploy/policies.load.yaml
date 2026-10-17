@@ -1,0 +1,13 @@
+# Load test only. Not for deployment.
+# Start the service with POLICY_FILE=deploy/policies.load.yaml.
+policies:
+  # So large that the load test never gets denied: measures the allow path.
+  - name: load_open
+    algorithm: token_bucket
+    limit: 1000000000
+    period: 1s
+  # A realistic limit, used to measure the deny path once it is used up.
+  - name: load_hot
+    algorithm: token_bucket
+    limit: 100
+    period: 1m
