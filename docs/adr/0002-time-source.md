@@ -22,12 +22,13 @@ disagree about which window a request belongs to.
   `sleep`, and cannot be flaky.
 - Scripts are deterministic: the same arguments and state give the same result.
   Some hosted Redis services are stricter about non-deterministic commands in
-  scripts; whether the target one is is checked in Phase 6.
+  scripts; Upstash, the one used in deployment, runs them unchanged.
 - Instances are assumed to have NTP-synced clocks. Their skew is milliseconds
   while windows are seconds long, so the effect on a decision is negligible.
 - If an instance's clock is behind the stored timestamp, elapsed time would be
   negative. The scripts clamp it to zero, so the bucket never refills backwards
-  (covered by the "now before stored timestamp" test in `tokenbucket_test.go`).
+  (covered by the "now before stored timestamp" test in
+  [`tokenbucket_test.go`](../../internal/limiter/tokenbucket_test.go)).
 - A badly skewed instance, off by seconds or more, could refill early or late.
   v1 does not defend against that.
 
@@ -38,3 +39,12 @@ disagree about which window a request belongs to.
   time-based test would need a real wait.
 - **The caller reads Redis `TIME` first, then passes it in.** Same clock for
   everyone, but an extra round trip on every decision.
+
+## Code
+
+- The clock is injected into the service:
+  [`NewRateLimit`](../../internal/service/ratelimit.go) takes `now`.
+- The window is computed once in Go: `windowOf` in
+  [`keys.go`](../../internal/limiter/keys.go).
+- The scripts read the time from `ARGV`:
+  [`internal/limiter/scripts/`](../../internal/limiter/scripts/).
