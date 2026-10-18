@@ -21,6 +21,7 @@ services:
     profiles: ["demo"]
     build:
       context: .
+      target: demo
       args:
         PKG: ./cmd/ratelimiter
     # No published ports: with replicas, a fixed host port would clash. Only the
@@ -54,6 +55,7 @@ services:
     profiles: ["demo"]
     build:
       context: .
+      target: demo
       args:
         PKG: ./examples/greeter
     environment:
