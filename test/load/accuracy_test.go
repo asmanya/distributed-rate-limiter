@@ -110,9 +110,13 @@ func TestAccuracy(t *testing.T) {
 					Policy:    "accuracy",
 					Key:       "hot",
 					Limit:     limit,
-					Period:    time.Minute,
-					Cost:      1,
-					Now:       fixedNow,
+					// Long on purpose. The clock is fixed, but the key's TTL (time to a full
+					// refill) runs in real time. With a short period the TTL is a few
+					// hundred ms, and on a Redis with a slow round trip the key expires
+					// mid-test and the bucket starts full again: more than 500 allowed.
+					Period: time.Hour,
+					Cost:   1,
+					Now:    fixedNow,
 				}
 				t.Cleanup(func() { _ = limiters[0].Reset(context.Background(), req) })
 
