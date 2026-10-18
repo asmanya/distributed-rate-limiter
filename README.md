@@ -75,6 +75,11 @@ docker compose --profile demo up -d --build --wait
 ```bash
 grpcurl -plaintext localhost:50051 list
 
+# warm-up with another key, see the note below
+grpcurl -plaintext -H 'x-api-key: warmup' -d '{"name":"world"}' \
+  localhost:50051 examples.greeter.v1.GreeterService/SayHello
+sleep 1
+
 for i in $(seq 1 10); do
   grpcurl -plaintext -H 'x-api-key: demo' -d '{"name":"world"}' \
     localhost:50051 examples.greeter.v1.GreeterService/SayHello
@@ -86,6 +91,12 @@ docker compose --profile demo logs ratelimiter | grep '"message":"rpc"'
 The greeter allows 5 calls per 10 seconds per API key. The first five return
 `{"message": "Hello, world!"}`, the rest `ResourceExhausted` with a `RetryInfo`
 detail. The demo logs every call, prefixed with the replica that served it.
+
+Why the warm-up: the greeter fails open and gives the limiter 100 ms per call.
+Right after it starts, its connection to the limiter is not open yet, so one of
+the first calls can time out and pass without being counted (the greeter logs
+`failing open`). Without the warm-up, more than five of the ten calls can
+succeed.
 
 Stop it with `docker compose --profile demo down` (`make down` stops only Redis).
 
@@ -337,12 +348,12 @@ per failed RPC (successful ones at debug); request keys are never logged.
 
 | Command | |
 | --- | --- |
-| `make tools` | Install the pinned tools |
-| `make proto` | Lint the `.proto` files and regenerate `gen/` |
-| `make lint` | `golangci-lint` and `buf lint` |
+| `make tools` | Install the proto plugins pinned in `go.mod` |
+| `make proto` | Lint the `.proto` files and regenerate `gen/`; needs `buf` |
+| `make lint` | `golangci-lint` and `buf lint`; needs both installed |
 | `make test` | Unit tests, `-race` |
 | `make test-integration` | Integration tests; needs `make up` and `REDIS_URL` exported, or they skip |
-| `make load` | The benchmark matrix, about 15 minutes, local Redis only |
+| `make load` | The benchmark matrix, about 15 minutes, local Redis only; needs `ghz` |
 | `make deploy` | Build and deploy to Cloud Run |
 
 ## License
