@@ -58,3 +58,7 @@ jobs:
         with:
           go-version-file: go.mod
       - run: make test-integration
+      # Build only, no push: a broken Dockerfile shows up on the pull request,
+      # not on deploy day. This is the production stage, the one Cloud Run builds.
+      - name: Build docker image
+        run: docker build --build-arg PKG=./cmd/ratelimiter .
