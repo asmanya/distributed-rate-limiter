@@ -33,6 +33,21 @@ Whether to fail open or closed is decided by the caller, per call site, through
 the configuration of the client SDK (`pkg/client`). The service has no
 failure-mode setting.
 
+## Consequences
+
+- The service stays small and honest: it either returns a decision or says it
+  cannot. The behaviour is tested in
+  [`ratelimit_test.go`](../../internal/service/ratelimit_test.go) and shown end
+  to end in [chaos.md](../chaos.md) (Redis paused and stopped: `Unavailable` at about the
+  50 ms timeout, health still `SERVING`).
+- Every caller has to choose. A wrong choice has a cost either way: failing open
+  during an outage lets traffic past the limit, failing closed turns a Redis
+  outage into an outage of the caller.
+- The SDK makes the choice explicit rather than hide it behind a default: its
+  fail mode is a required option, and creating a client without one is an error.
+  A caller that uses gRPC directly, without the SDK, must handle `Unavailable`
+  itself.
+
 ## Alternatives considered
 
 **A failure mode per policy, configured in the service.** Rejected. It does not
@@ -46,20 +61,6 @@ whenever Redis fails. Rejected. It makes "allowed" and "could not check" look th
 same to the caller, hides the outage from metrics and logs on the caller's side,
 and silently removes the limit exactly where it is needed most.
 
-## Consequences
-
-- The service stays small and honest: it either returns a decision or says it
-  cannot. The behaviour is tested in `internal/service` and shown end to end in
-  [chaos.md](../chaos.md) (Redis paused and stopped: `Unavailable` at about the
-  50 ms timeout, health still `SERVING`).
-- Every caller has to choose. A wrong choice has a cost either way: failing open
-  during an outage lets traffic past the limit, failing closed turns a Redis
-  outage into an outage of the caller.
-- The SDK makes the choice explicit rather than hide it behind a default: its
-  fail mode is a required option, and creating a client without one is an error.
-  A caller that uses gRPC directly, without the SDK, must handle `Unavailable`
-  itself.
-
 ## References
 
 - Envoy's rate limit filter takes the same position: `failure_mode_deny` is set
@@ -70,3 +71,9 @@ and silently removes the limit exactly where it is needed most.
   code (or if Redis were to go down), requests wouldn't be affected".
   [Scaling your API with rate limiters](https://stripe.com/blog/rate-limiters)
   (Paul Tarjan, 2017)
+
+## Code
+
+- Error to status mapping: [`errors.go`](../../internal/service/errors.go).
+- The SDK's required fail mode: [`client.go`](../../pkg/client/client.go),
+  tested in [`behaviour_test.go`](../../pkg/client/behaviour_test.go).
