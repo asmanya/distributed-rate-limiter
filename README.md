@@ -7,7 +7,8 @@ store. It answers one question: may this key spend `cost` units right now?
 Replicas keep no counters of their own, so a limit holds across all of them. A Go
 SDK plugs it into a gRPC server or a `net/http` handler.
 
-Work in progress. The SDK is v0, and its API can change before v1.0.0.
+A demo instance runs on Cloud Run, see [Deploy to Cloud Run](#deploy-to-cloud-run).
+Work in progress: the SDK is v0, and its API can change before v1.0.0.
 
 ## How it works
 
@@ -141,7 +142,7 @@ For HTTP: `limiter.HTTPMiddleware("search", client.KeyFromHeader("X-API-Key"))(h
 
 ## Running the service
 
-Needs Go 1.27 and Docker.
+Needs Go 1.27, Docker and grpcurl.
 
 ```bash
 make up    # Redis 8 in Docker
@@ -223,7 +224,7 @@ restart every replica.
 
 On platforms that cannot send `SIGHUP` (Cloud Run, for one), changing a policy
 needs a redeploy. Cloud Run gives 10 seconds between `SIGTERM` and `SIGKILL`,
-the same as the default `SHUTDOWN_TIMEOUT`, so set it lower there.
+the same as the default `SHUTDOWN_TIMEOUT`, so the deploy sets it to 8 s.
 
 ## Observability
 
@@ -247,6 +248,92 @@ Logging. One line per RPC with method, code, duration and peer. Successful
 calls log at debug, so at the default `info` you only see problems. Request
 keys are never logged.
 
+## Deploy to Cloud Run
+
+The service runs on Cloud Run with Upstash as the Redis. There is no CD:
+`make deploy` builds the image from the working directory and deploys it.
+
+### Live endpoint
+
+```bash
+grpcurl ratelimiter-748792177625.asia-south1.run.app:443 list
+```
+
+TLS ends at the Cloud Run edge on port 443. The container serves plain HTTP/2
+(h2c) on `PORT`, which is why the service is deployed with `--use-http2`.
+
+With `--min-instances 0` the first call after an idle period starts an instance.
+One measurement, from a laptop with `grpcurl list` after about 20 idle minutes:
+1.014 s for the cold call, 0.244 s for the next one. Both include the TLS
+handshake and the reflection round trips, so the cold start itself is the
+difference, about 0.77 s.
+
+This is a demo endpoint: it may be throttled or offline. It has no
+authentication, so anyone can call it. `AdminService` is not registered
+(`ADMIN_ENABLED=false`), and the service is capped at 2 instances.
+
+Cloud Run routes traffic to one port only, so `/metrics` on `METRICS_PORT` is not
+reachable from outside. Logs go to Cloud Logging, where `severity` is read from
+the JSON lines.
+
+### What `make deploy` sets
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Image | the last `Dockerfile` stage: distroless, non-root, 37.4 MB (size of the local image) | no shell, no package manager |
+| `--use-http2` | on | gRPC needs HTTP/2 all the way to the container |
+| `--max-instances` / `--min-instances` | 2 / 0 | caps cost and abuse; costs nothing when idle |
+| `REDIS_URL` | from Secret Manager (`redis-url`) | it holds the password: never a plain env var value, never in the repo or the logs |
+| `REDIS_TIMEOUT` | 200 ms | a starting value. From Cloud Run, an `Allow` took 4.7 to 9.4 ms in the 6 calls measured, so it is generous |
+| `SHUTDOWN_TIMEOUT` | 8 s | Cloud Run sends `SIGKILL` 10 s after `SIGTERM` |
+| `ADMIN_ENABLED` | `false` | `Reset` must not be reachable on a public endpoint |
+
+The startup probe is a gRPC health check, set once on the service. `make deploy`
+keeps it:
+
+```bash
+gcloud run services update ratelimiter --region asia-south1 \
+  --startup-probe=grpc.port=8080,periodSeconds=5,timeoutSeconds=2,failureThreshold=6
+```
+
+There is no liveness probe on purpose: health does not depend on Redis, and a
+restart would not fix a Redis outage.
+
+### One-time setup
+
+Needs `gcloud` logged in and `REDIS_URL` in the shell (for example
+`set -a; . ./.env; set +a`). Replace `PROJECT_ID` and `PROJECT_NUMBER`.
+
+```bash
+gcloud config set project PROJECT_ID
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+  artifactregistry.googleapis.com secretmanager.googleapis.com
+
+# The URL goes in through stdin, so it stays out of the shell history.
+# printf, not echo: a trailing newline would become part of the URL.
+printf %s "$REDIS_URL" | gcloud secrets create redis-url --data-file=-
+
+gcloud iam service-accounts create ratelimiter-run
+gcloud secrets add-iam-policy-binding redis-url \
+  --member=serviceAccount:ratelimiter-run@PROJECT_ID.iam.gserviceaccount.com \
+  --role=roles/secretmanager.secretAccessor
+
+# Cloud Build runs as the default compute account and has to read the uploaded
+# source. A new project does not grant that, and the first deploy fails with a 403.
+gcloud projects add-iam-policy-binding PROJECT_ID \
+  --member=serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com \
+  --role=roles/cloudbuild.builds.builder
+
+make deploy    # the first run asks to create an Artifact Registry repository
+```
+
+Then set the startup probe once, with the command above.
+
+Upstash was checked with the integration suite: the scripts, including the
+`no-writes` flag that `Peek` uses, work there. Its free tier allows 500K commands
+a month. Repeated runs of the suite used 474K of them, so run it against Upstash
+once, not in a loop.
+
 ## Benchmarks
 
 Median of 3 runs, 30 s each, with `ghz` over one gRPC connection against a
@@ -262,8 +349,9 @@ one AMD Ryzen 5 5600H laptop inside WSL2.
 
 With 10,000 keys, going from 50 to 100 clients raised RPS by 18 % and p50 by
 71 %. At 100 clients Redis was at 89 to 93 % of one core (one sample per run),
-and a CPU profile showed no hot spot in the service's own code. The ceiling is the Redis round trip. A hot key is no
-slower than 10,000 keys because Redis runs every script on one thread anyway.
+and a CPU profile showed no hot spot in the service's own code. The ceiling is
+the Redis round trip. A hot key is no slower than 10,000 keys because Redis runs
+every script on one thread anyway.
 
 One machine, no network between the parts. Hosted Redis, Redis Cluster and the
 sliding window were not measured. Method, raw output and analysis:
@@ -278,7 +366,8 @@ sliding window were not measured. Method, raw output and analysis:
 | `make lint` | `golangci-lint` and `buf lint` |
 | `make test` | Unit tests, with `-race` |
 | `make test-integration` | Integration tests against a real Redis. Run `make up` and export `REDIS_URL` first, or they skip |
-| `make load` | The benchmark matrix, about 15 minutes |
+| `make load` | The benchmark matrix, about 15 minutes. Local Redis only |
+| `make deploy` | Build and deploy to Cloud Run (see [Deploy to Cloud Run](#deploy-to-cloud-run)) |
 
 Design decisions are recorded in [`docs/adr/`](docs/adr/).
 
